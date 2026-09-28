@@ -1,227 +1,206 @@
-# Sparky Command Center
+# Command Center v2
 
-A lightweight, dependency-free command center for a **DGX Spark fleet** (and any GPU boxes you add alongside it, like 3090 rigs). Monitor the whole cluster over SSH on one glassmorphic page: live GPU / CPU / memory / temperature / power, an optional RoCE fabric-switch panel, and per-model decode, prefill, and TTFT.
+A read-only command center for a self-hosted AI fleet, with a live Three.js constellation of your machines and a built-in chat assistant that runs on **your own model**.
 
-Point it at your own hardware with a single `config.json`. No database, no build step, no third-party packages — just Python 3.8+ and SSH.
+It watches:
 
-> Repo: **`sparky-command-center`**
+- **GPU nodes** over SSH: unified-memory boxes (DGX Spark / GB10 class) and hosts with discrete GPUs (RTX, A-series). Temperature, power, utilization, clocks, memory, fans, CPU temperature, running containers, and a temperature sparkline per GPU.
+- **A fabric switch** (MikroTik RouterOS): temperatures, fans, PSUs, uptime, and live throughput per port.
+- **Model servers** (vLLM, SGLang, llama.cpp) through their Prometheus `/metrics`: decode and prefill tok/s, TTFT, KV-cache use, running and waiting requests, and the live model id.
+- **ComfyUI render lanes**: up/idle/rendering, queue depth, and memory, taken from the driver (not ComfyUI's own estimate), with peak-while-rendering marks.
+- **Tokens served** per model, banked across server restarts, with a per-day count.
+- Optional extras: GPU clock caps (status plus, if you allow it, apply), links to other web apps on the host with an up/down probe, and Elgato key lights.
 
-## Features
+The chat ("Jarvis" by default) sees the same live data the board shows, so you can ask *"what is down right now?"* or *"which node is running hottest?"* and get an answer grounded in the current numbers.
 
-- **Fleet at a glance** — one page with a summary strip (online GPUs, total power draw, hottest GPU, and thermal/reachability-aware fleet status).
-- **Per-GPU hardware metrics** — temperature, power draw and % of cap, utilization, VRAM used/total, fan speed, and graphics clock, with a live temperature sparkline per GPU.
-- **Per-node system metrics** — host temperature (AMD `k10temp`, Intel `coretemp`, ARM `cpu_thermal`, ACPI `acpitz`, and more), extra thermal sensors, and system RAM. Works for DGX Sparks and any other Linux GPU host.
-- **Per-model inference metrics** — decode tok/s, prefill tok/s, TTFT, KV-cache usage, and running/waiting request counts, scraped from each model's Prometheus `/metrics`. Works with **vLLM** and **llama.cpp** servers.
-- **Live per-request speeds** — while requests are in flight, a pulsing strip pops up on the model card showing what each request is actually getting: one request shows its true decode tok/s; N concurrent shows the ~N-way split plus the combined engine rate (`4 live · ~14.6 tok/s each · 58.2 combined`); a request still in prefill shows the prefill rate instead of a misleading zero.
-- **Multiple instances, side by side** — run more than one model shape on a node, *or* run two instances across the fleet, and each gets its own perf card (separate decode / prefill / TTFT / KV).
-- **Cumulative token tracker** — a **Token Tracker** panel (and a `/api/tokens` endpoint) showing total tokens served per model, split into prompt vs generated, plus a per-day bucket. It banks the same `/metrics` token counters the perf cards already read, so a model-server restart (which zeroes those counters) never wipes your running history. Works out of the box for every configured model; toggle with `server.token_tracking`.
-- **Optional video / image generation lanes** — a **Video Generation** panel (and `/api/comfy`) for ComfyUI-style servers, one card per GPU or instance: live VRAM used with a usage bar, free/total, queue depth, an idle / RENDERING / offline state light, and a click-through link into that lane's own UI. Each card also carries a **peak-while-rendering high-water mark**, which is the number that actually matters for capacity planning: these models load their components one at a time, so idle understates the footprint and summing the parts overstates it. Add `comfy_lanes` to enable; the panel hides itself entirely when the list is empty.
-- **Collapsible, re-orderable panels** — every panel has a header you can click to collapse, a **Collapse all / Expand all** toggle, and a **Rearrange** mode that lets you drag panels into whatever order you want. Layout is saved per browser in `localStorage`, so the server stays stateless and nothing is shared between viewers.
-- **Optional RoCE fabric-switch panel** — MikroTik / RouterOS over SSH: switch and CPU temps, fans, PSUs, uptime, and live per-port fabric throughput with link speeds. Add a `switch` block to enable it, delete the block to hide it.
-- **Config-driven** — every node, host, user, SSH key, jump host, model endpoint, port, and label lives in `config.json`. Add or remove nodes and models by editing one file.
-- **Bastion / jump-host support** — reach nodes that are only accessible through another box via standard SSH ProxyJump.
-- **Read-only and resilient** — only ever *queries* state (`nvidia-smi` queries, `/proc`, hwmon, RouterOS `print`/`monitor once`, HTTP GETs). Nothing restarts, reconfigures, or kills anything. Unreachable nodes/models/switch degrade to a "stale" state; a poller never crashes the app.
-- **Dependency-free** — Python 3.8+ standard library only. No `pip install`.
+Stack: Python 3.9+ standard library for the server (no pip installs), Vite + React + TypeScript + React Three Fiber + GSAP + Lenis for the UI.
 
-## Screenshot
-
-<!-- add a screenshot here -->
-
-## Requirements
-
-- **Python 3.8+** on the machine that runs the dashboard.
-- **SSH access** from that machine to each node (key-based; the key should log in without a password prompt). The nodes are expected to be Linux.
-- **`nvidia-smi`** on each GPU node (ships with the NVIDIA driver). Host temperatures come from `hwmon` under `/sys/class/hwmon` and system RAM from `free` (queried with a stable C locale).
-- **Optional:** a vLLM or llama.cpp server per model, exposing Prometheus `/metrics` and OpenAI-style `/v1/models`, for the model performance cards.
-- **Optional:** a MikroTik / RouterOS fabric switch reachable over SSH, for the switch panel.
-
-## Quick Start
+## Quick start
 
 ```bash
-# 1. Copy the example config and edit it for your hardware
-cp config.example.json config.json
-$EDITOR config.json
-
-# 2. Run the dashboard (no dependencies to install)
+git clone https://github.com/tonyd2wild/The-Sparky-Command-Center.git && cd The-Sparky-Command-Center
+cp config.example.json config.json      # then edit it for your machines
 python3 server.py
-
-# 3. Open it
-#    http://localhost:8890
+# open http://localhost:8895
 ```
 
-To use a config file somewhere else, set the `CONFIG` environment variable:
+The built UI ships in `web/dist`, so running it needs nothing but Python 3.9+. Node 18+ is only needed if you want to change the UI: `cd web && npm install && npm run build`.
+
+> **v2 (September 2026)** is a full rebuild: a Three.js constellation of your fleet, a new card layout, themes (Dark, Light, Sunset, Breeze, Matrix) and a built-in chat you can point at your own local model or agent. The original single-file v1 is still available at the [`v1` tag](https://github.com/tonyd2wild/The-Sparky-Command-Center/tree/v1).
+
+The machines you monitor need:
+
+- `nvidia-smi` installed.
+- Key-based SSH from the box running this server. It uses `BatchMode=yes`, so a node that asks for a password fails fast instead of hanging.
+- For model cards, an inference server with `/metrics` enabled (vLLM and SGLang expose it by default; for llama.cpp, start `llama-server` with `--metrics`).
+
+Nothing needs to be installed on the nodes.
+
+## Connect the chat to your own model
+
+The chat speaks the OpenAI chat-completions protocol, so it works with anything that serves `/v1/chat/completions`. Set a base URL and a model name, either in `config.json`:
+
+```json
+"chat": {
+  "base_url": "http://localhost:11434/v1",
+  "model": "llama3.1:8b"
+}
+```
+
+or in `.env` (copy `.env.example`), which overrides the config:
 
 ```bash
-CONFIG=/path/to/my-fleet.json python3 server.py
+CC_CHAT_BASE_URL=http://localhost:11434/v1
+CC_CHAT_MODEL=llama3.1:8b
 ```
 
-Verify SSH works first — the dashboard runs the same commands you can run by hand:
+| Server | `base_url` | Notes |
+| --- | --- | --- |
+| Ollama | `http://localhost:11434/v1` | model = the Ollama tag, e.g. `qwen2.5:14b` |
+| vLLM | `http://localhost:8000/v1` | model = the `--served-model-name` |
+| SGLang | `http://localhost:30000/v1` | |
+| llama.cpp server | `http://localhost:8080/v1` | model can be any string |
+| LM Studio | `http://localhost:1234/v1` | |
+| Any hosted OpenAI-compatible API | its `/v1` URL | put the key in `CC_CHAT_API_KEY` |
+
+Restart `server.py` after changing the chat settings. If no model is set, or the one you set cannot be reached, the chat panel shows a "connect a model" screen with these steps. The rest of the board keeps working.
+
+### Or connect it to an agent
+
+If you run an agent that exposes an OpenAI-compatible API (for example a Hermes profile with its API server turned on), point the chat at the agent instead of the raw model. You get the agent's memory and tools behind the same chat box:
 
 ```bash
-ssh youruser@spark1.example.local nvidia-smi
+CC_CHAT_BASE_URL=http://127.0.0.1:8643/v1
+CC_CHAT_MODEL=<the model name the agent's API reports>
+CC_CHAT_API_KEY=<the agent's API key>
 ```
 
-If that succeeds without prompting for a password, the dashboard will be able to poll the node.
+No other change is needed. The dashboard still adds its live-data context as the system message, and the agent answers.
 
-## Configuration
+### How the chat behaves
 
-The config is a single JSON file (default `./config.json`, override with the `CONFIG` env var). Fields marked *optional* fall back to the `defaults` block or a sensible built-in.
+- **Grounded.** Every turn gets a system message with a compact read of the live board, taken at the moment you ask: totals, a "down right now" list with error text, every node, the switch, each model server, each render lane, token counts and station status. Turn it off with `"grounding": false`.
+- **Careful.** Temperature defaults to 0.1, and the prompt forbids inventing numbers and tells the model it cannot change anything.
+- **Streams tokens.** Reasoning is stripped, whether it arrives as `reasoning_content` or inside `<think>` tags.
+- **Fallbacks.** List extra endpoints in `chat.fallbacks`. A connection failure moves to the next endpoint. An HTTP error from a model that answered is shown as-is, not retried.
+- **Local history.** The conversation lives in the viewer's browser (localStorage), with a Clear button.
+- **Extra fields.** `chat.extra_body` is merged into every request. For example, `{"chat_template_kwargs": {"enable_thinking": false}}` turns thinking off on vLLM-served reasoning models. Leave it empty for servers that reject unknown fields.
+
+## Configuration reference
+
+`config.json` is gitignored and holds everything site-specific. `config.example.json` shows every block with made-up hosts. Keys starting with `_` are ignored.
 
 ### `server`
 
-| Field | Description | Example |
+| Key | Default | Meaning |
 | --- | --- | --- |
-| `title` | Header text and browser tab title. | `"Sparky Command Center"` |
-| `subtitle` | Small line under the title. | `"my rig"` |
-| `bind` | Interface to bind. `0.0.0.0` = all interfaces, `127.0.0.1` = localhost only. | `"0.0.0.0"` |
-| `port` | HTTP port for the dashboard. | `8890` |
-| `browser_refresh_ms` | How often the browser re-polls `/api/metrics`, in milliseconds. | `2500` |
-| `token_tracking` | Track cumulative tokens served per model (the Token Tracker panel + `/api/tokens`). Reads the `/metrics` counters already polled and banks the deltas across inference-server restarts. Set `false` to disable. | `true` |
-| `token_store` | Path to the persistent token-usage JSON (banked totals + per-day buckets). Relative paths resolve from the working directory. The default lives under the gitignored `data/` dir. | `"data/token_usage.json"` |
-| `comfy_poll_seconds` | How often each video/image lane is polled, in seconds. Kept tight so a render's VRAM peak is not missed between samples. | `4` |
-
-> **How the token tracker stays honest across restarts.** vLLM / llama.cpp expose *monotonic* `prompt_tokens_total` / `generation_tokens_total` counters that reset to `0` every time the server restarts. The tracker snapshots them each poll and banks the delta into `token_store`; when it sees the counter go *backwards* it treats that as a restart and adds the new value from `0`. On first sight of a model it seeds the total with the current running-session value so the numbers are real immediately, and the per-day bucket rolls over at local midnight.
+| `title`, `subtitle`, `location` | | Header text. The nav word is the title minus "Command Center". |
+| `timezone` | system | IANA name used for the UI clock and the chat's sense of time. |
+| `bind` | `["127.0.0.1"]` | One address or a list. Add a VPN/tailnet IP to reach it from your phone. Avoid `0.0.0.0` on untrusted networks. |
+| `port` | `8895` | |
+| `allowed_hosts` | `[]` | Extra Host names allowed to POST (for example a tailnet DNS name). |
+| `read_only` | `true` | Refuses every route that changes another machine. |
+| `browser_refresh_ms` | `2500` | How often the page re-polls `/api/metrics`. |
 
 ### `ssh`
 
-| Field | Description | Example |
-| --- | --- | --- |
-| `default_key` | SSH private key for any node/switch that doesn't set its own `ssh_key`. `~` is expanded. | `"~/.ssh/id_ed25519"` |
-| `connect_timeout` | Seconds to wait for an SSH connection before giving up. | `8` |
-| `options` | Extra `-o Key=Value` options applied to every `ssh` call. `BatchMode=yes` makes a node that would prompt for a password fail fast instead of hanging. | `{ "BatchMode": "yes" }` |
-
-### `defaults`
-
-Fallback values for any node/model that doesn't set its own.
-
-| Field | Description | Example |
-| --- | --- | --- |
-| `poll_interval` | Seconds between SSH polls of a node. | `6.0` |
-| `model_poll_interval` | Seconds between `/metrics` scrapes of a model. | `6.0` |
-| `temp_warn` | GPU temperature (°C) that turns the pill yellow. | `70` |
-| `temp_hot` | GPU temperature (°C) that turns the pill red. | `84` |
+`default_key`, `connect_timeout` and `options` (extra `-o` flags). A node can override the key with `ssh_key` and the port with `ssh_port`.
 
 ### `nodes[]`
 
-One entry per machine to monitor — a DGX Spark, a 3090 box, any Linux GPU host.
+| Key | Meaning |
+| --- | --- |
+| `key`, `name` | Id and display name. |
+| `profile` | `unified` (GPU shares system RAM: DGX Spark, GB10, Jetson) or `discrete` (PCIe GPUs). |
+| `user`, `host` | SSH target. |
+| `jump` | Optional. `{"user", "host", "mode": "proxy"}` uses `ssh -J`. `"mode": "nested"` runs `ssh` from the jump host itself, for LAN nodes that only trust the jump host's key. |
+| `node_id`, `rank`, `serving`, `pair` | Unified nodes: labels on the card (what the node is serving and its role). |
+| `badge`, `list_containers`, `containers` | Discrete hosts: card badge, whether to list `docker ps` names, and friendly labels per container name. |
+| `temp_warn`, `temp_hot`, `poll_interval` | Per-node overrides of `defaults`. |
 
-| Field | Required | Description |
-| --- | --- | --- |
-| `name` | yes | Display name for the node. |
-| `host` | yes | Hostname or IP reachable over SSH. |
-| `user` | yes | SSH username. |
-| `ssh_key` | no | Per-node key path (overrides `ssh.default_key`). |
-| `port` | no | SSH port (default `22`). |
-| `jump_host` | no | Bastion/jump host (SSH ProxyJump) for a node only reachable through another box. |
-| `jump_user` | no | Username for the jump host. |
-| `poll_interval` | no | Per-node SSH poll cadence in seconds. |
-| `temp_warn` | no | GPU temp (°C) for the yellow pill. |
-| `temp_hot` | no | GPU temp (°C) for the red pill. |
-| `models` | no | List of inference endpoints running on this node (see below). |
+### `sections[]`
 
-### Model instances
+The board groups nodes into sections: `{"key", "eyebrow", "title", "subtitle", "nodes": [...], "switch": true, "units": [...], "models_title"}`. A section shows its nodes, the switch card if `switch` is true, and every model whose `unit` is in `units`. Leave `sections` out and the server builds a sensible default.
 
-Model cards can come from two places, and both accept the same fields:
+### `switch`
 
-- **`nodes[].models[]`** — inference servers running *on that node*. List more than one to watch multiple model shapes on the same box; each is rendered under that node's *Model performance* section.
-- **`models[]`** (top level) — **fleet-wide** instances that aren't tied to a single node (e.g. run two instances across the cluster, each spanning several GPUs, and watch both). Each is rendered in its own section. Add an optional `group` to give a set of instances a shared header.
+MikroTik RouterOS over plain SSH (`host`, `user`, `ssh_key`), or any command you like through `exec`, for example an `expect` helper: `{"argv": ["expect", "helper.exp", "{cmd}"], "cwd": "/path"}`. `ports` lists the interfaces to chart. Delete the block, or set `"enabled": false`, to hide it.
 
-| Field | Required | Description |
-| --- | --- | --- |
-| `label` | yes | Display name for the model card. |
-| `endpoint` | yes | Base URL of the inference server (vLLM or llama.cpp). `/metrics` and `/v1/models` are appended automatically. |
-| `port` | no | Port label shown on the card. |
-| `model` | no | Served alias to prefer when `/v1/models` lists several ids. |
-| `gpus` | no | Human label for the GPUs the model uses, e.g. `"GPU 0-1"` or `"Sparks 1-2 (TP=2)"`. |
-| `group` | no | (Top-level `models[]` only) Section header shared by a set of instances. |
+### `models[]`
 
-### `comfy_lanes[]` (optional)
+`{"key", "label", "unit", "node", "endpoint", "port", "gpus", "model", "api_key"}`:
 
-ComfyUI-style image/video servers. One entry per GPU or per instance. Omit the
-list (or leave it empty) and the Video Generation panel does not render at all.
+- `endpoint` is the server's base URL; `/metrics` and `/v1/models` are appended.
+- `node` ties the model to a host in the 3D view.
+- `model` picks the preferred alias when a server lists several.
 
-| Field | Meaning | Required |
-|---|---|---|
-| `url` | Base URL of the ComfyUI server, e.g. `http://10.0.0.10:8188`. Also the click-through link on the card. | yes |
-| `key` | Stable id for the lane. Derived from `name` when omitted. | no |
-| `lane` | Short label shown on the card badge, e.g. `A`. Defaults to the position. | no |
-| `name` | Human label, e.g. `gpu-box · GPU 0`. | no |
-| `host` | Free-text machine name shown in the card footer. | no |
+### `comfy_lanes[]`
 
-```json
-"comfy_lanes": [
-  { "key": "lane-a", "lane": "A", "name": "gpu-box · GPU 0", "host": "gpu-box", "url": "http://10.0.0.10:8188" },
-  { "key": "lane-b", "lane": "B", "name": "gpu-box · GPU 1", "host": "gpu-box", "url": "http://10.0.0.10:8189" }
-]
+`{"key", "lane", "name", "host", "url", "src"}`. `src` points the memory reading at a GPU you already monitor:
+
+- `{"kind": "gpu", "node": "<key>", "index": 0}` for a discrete GPU.
+- `{"kind": "unified", "node": "<key>"}` for a unified node.
+
+### `tokens`
+
+- `mode: "bank"` (default): polls each model's counters every `poll_seconds` and banks them into `store`, surviving server restarts. Rows for models you remove are archived under `_retired`, not deleted.
+- `mode: "read"`: only reads a store that another process maintains.
+
+`order` sets the card order.
+
+### `eco`, `stations`, `keylights`
+
+Off by default.
+
+- `eco`: GPU clock caps on unified nodes. Status is a read-only query. Apply needs `"allow_writes": true` and `server.read_only: false`, and uses `sudo nvidia-smi -lgc`.
+- `stations`: a list of `{emoji, name, desc, url, probe_url}` links with an up/down probe.
+- `keylights`: proxies an Elgato key-light panel's `/api/lights`. Setting the lights needs `allow_writes`.
+
+### `chat`
+
+`enabled`, `name`, `base_url`, `model`, `api_key` (or `api_key_file`), `system_prompt` (replaces the default persona line; the rules and live data are always added), `temperature`, `max_tokens`, `timeout`, `history_turns`, `grounding`, `extra_body`, `fallbacks[]`, `suggestions[]`.
+
+Environment variables:
+
+| Variable | Overrides |
+| --- | --- |
+| `CC_CONFIG` | path to the config file |
+| `CC_PORT`, `CC_BIND` | `server.port`, `server.bind` |
+| `CC_READ_ONLY` | `server.read_only` |
+| `CC_CHAT_BASE_URL`, `CC_CHAT_MODEL`, `CC_CHAT_API_KEY` | the matching `chat` fields |
+| `CC_CHAT_SYSTEM_PROMPT`, `CC_CHAT_NAME` | the matching `chat` fields |
+
+## Safety
+
+- Monitoring only runs queries: `nvidia-smi --query-*`, `/proc/meminfo`, `free`, `docker ps`, and RouterOS `print` / `monitor once`. Nothing restarts or reconfigures anything.
+- With `read_only: true` (the default), `POST /api/eco-set` and `POST /api/lights-set` return 403, and their buttons stay visible but disabled.
+- `POST` routes are same-origin only: a known Host, a matching Origin, and a JSON content type. This stops another site from driving your chat or your actions from a browser.
+- The browser never receives hosts, keys or endpoints from the config. `/api/config` only sends layout and labels. Model and ComfyUI URLs do appear on cards and in `/api/metrics`, so keep the server on localhost or a private network.
+
+## API
+
+| Route | Returns |
+| --- | --- |
+| `GET /api/metrics` | Every node, the switch, the model servers, temperature history and fleet totals. It also carries `sparks` / `box` / `*_models` for v1 consumers. |
+| `GET /api/comfy` | Render lanes. |
+| `GET /api/tokens` | The token store. |
+| `GET /api/stations` | Stations with up/down. |
+| `GET /api/lights` | The key-light panel's lights. |
+| `GET /api/eco-status` | Current GPU clock / temperature / power per unified node (read-only). |
+| `GET /api/config` | UI layout and labels only. |
+| `GET /api/chat/status` | Whether a model is configured and reachable. |
+| `POST /api/chat` | `{"messages": [...]}`, answered as a server-sent-event stream of `{"delta"}` / `{"status"}` / `{"reset"}` / `{"meta"}`, then `[DONE]`. |
+| `GET /healthz` | `ok` |
+
+## Development
+
+```bash
+python3 server.py                     # API on :8895
+cd web && npm run dev                 # UI on :5176, proxies /api to :8895
 ```
 
-Two instances on the *same* GPU box are normal and cheap: ComfyUI mmaps the
-model weights, so a second instance costs a few GB rather than a second full
-copy. Give each instance its own `--temp-directory`, `--database-url` and
-`--user-directory` when you launch it, or they will fight over state.
-
-Polling is read-only: `GET /system_stats` for liveness and VRAM, `GET /queue`
-for running/pending counts. It is done server-side because ComfyUI sends no
-CORS headers, so a browser could not read these endpoints cross-origin.
-
-### `switch` (optional)
-
-Add a `switch` block to show a RoCE fabric-switch panel; delete the block to hide it entirely. The switch is reached over plain SSH (RouterOS runs the query and prints the result), so it uses the same key / jump-host mechanism as nodes.
-
-| Field | Required | Description |
-| --- | --- | --- |
-| `host` | yes | Hostname or IP of the switch, reachable over SSH. |
-| `user` | no | RouterOS SSH username (default `admin`). |
-| `name` | no | Display name for the panel. |
-| `badge` | no | Small badge label (default `RoCE FABRIC`). |
-| `ssh_key` | no | Per-switch key (overrides `ssh.default_key`). |
-| `port` | no | SSH port (default `22`). |
-| `jump_host` / `jump_user` | no | Bastion to reach the switch through. |
-| `poll_interval` | no | Seconds between switch polls (default `8`). |
-| `temp_warn` / `temp_hot` | no | Switch temperature thresholds in °C (default `55` / `70`). |
-| `ports` | no | Fabric interfaces to show throughput for, e.g. `["qsfp28-1-1", ...]`. Omit or `[]` to auto-detect running interfaces. |
-
-### Adding or removing things
-
-- **Add a node:** append an object to `nodes`.
-- **Remove a node:** delete its object from `nodes`.
-- **Add a model on a node:** append to that node's `models` list.
-- **Add a fleet-wide instance:** append to the top-level `models` list.
-- **A node with no models:** set `"models": []` — you'll still get its GPU/CPU/RAM cards.
-- **Hide the switch panel:** delete the `switch` block.
-
-See `config.example.json` for a complete, ready-to-edit starting point (it shows a node running two model shapes, a second GPU box, a node reached through a bastion, two fleet-wide instances, and a switch block).
-
-## How it works
-
-- On startup the server loads `config.json` and spins up one background thread per node, one per model, and one for the switch (if configured), each on its own staggered timer.
-- **Node pollers** open a single SSH connection per cycle and run read-only commands (`nvidia-smi --query-gpu=...`, a small `hwmon` temperature scan, and `free`), parse the output, and write the result into an in-memory cache.
-- **Model pollers** fetch each endpoint's Prometheus `/metrics` and `/v1/models` over HTTP, and compute decode/prefill tok/s as a rate between consecutive polls (TTFT and KV-cache come straight from the metrics).
-- **The switch poller** SSHes into RouterOS and runs `print` / `monitor once` queries for health, resources, and interface counters, computing per-port throughput as a delta between polls.
-- The browser polls `/api/metrics` (a JSON snapshot of the cache) on the configured cadence and renders the dashboard client-side. Polling and the browser refresh are fully decoupled, so a slow or unreachable node never blocks the page.
-- Endpoints: `/` (dashboard), `/api/metrics` (JSON snapshot), `/api/tokens` (banked cumulative token totals per model), `/healthz` (plain `ok`).
-
-## Contributing
-
-Issues and pull requests are welcome. This is intentionally a small, single-file, dependency-free project — please keep changes within the Python standard library and avoid adding a build step. Bug reports that include your (sanitized) config and the output of the SSH command the dashboard runs are the easiest to help with.
+Useful query flags: `?nowebgl=1` shows the SVG fallback map, and `?motion=reduce` forces the reduced-motion still frame.
 
 ## License
 
-[MIT](LICENSE)
-
-## 🍃 Clock ECO Mode
-
-Cap GPU clocks on any node — or the whole fleet — from the dashboard. On DGX Spark
-(GB10) boxes a 2200 MHz cap cuts GPU power ~30% and tames the notorious log-less
-thermal hard-offs, with very little decode cost (LLM decode is memory-bound). Full
-story and standalone fix: [DGX-Spark-Hard-Poweroff-Fix](https://github.com/tonyd2wild/DGX-Spark-Hard-Poweroff-Fix).
-
-- **Status** is always available: live clock / temp / watts from every configured node.
-- **Apply is disabled until you opt in**: create an `eco_key.txt` file next to
-  `server.py` containing a secret of your choice. The UI prompts for it once per
-  browser; requests without it get a 403. Keep the dashboard off the open internet
-  regardless — this button runs `sudo nvidia-smi` on your fleet.
-- Nodes need passwordless sudo for `nvidia-smi -lgc` / `-rgc`.
-- Levels: 2300 / 2200 (the proven sweet spot) / 2000 / 1800 / OFF (restore full clocks).
-- Applies instantly with **no reboot and no model restart**, and `-lgc` does not
-  survive a reboot on its own — see the fix repo for a systemd persistence unit.
+MIT

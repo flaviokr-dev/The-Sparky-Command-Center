@@ -1,15 +1,24 @@
-# Local config with real infrastructure details - never commit this
+# Local config with real infrastructure details: never commit these
 config.json
+config.*.local.json
+.env
+*.key
 
-# Runtime / cache
-data/
+# Runtime data
+data/*
+!data/.gitkeep
+*.log
+nohup.out
+
+# Python
 __pycache__/
 *.pyc
-*.log
 
-# Editor / OS cruft
-*.bak*
+# Web build + deps
+web/node_modules/
+web/*.tsbuildinfo
+
+# Editor / OS / backups
 .DS_Store
-
-# Clock ECO mode write key - never commit this
-eco_key.txt
+*.bak*
+docs/shots/

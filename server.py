@@ -1,86 +1,101 @@
 #!/usr/bin/env python3
 """
-LLM Fleet Monitor
-=================
-A lightweight, dependency-free web dashboard to monitor a fleet of LLM inference
-nodes over SSH: live GPU / CPU / memory / temperature / power plus per-model
-decode, prefill, and TTFT.
+Agency Command Center v2
+========================
+A read-only command center for a self-hosted AI fleet: GPU nodes (discrete cards or
+unified-memory boxes like the DGX Spark), an optional RoCE fabric switch, the model
+servers running on them (vLLM, SGLang, llama.cpp), ComfyUI render lanes, cumulative
+token usage, and a built-in chat assistant that talks to ANY OpenAI-compatible
+/v1/chat/completions endpoint (a local model, or an agent that exposes that API).
 
-Everything host- and model-specific is loaded from a JSON config file at startup
-(path via the CONFIG env var, default ./config.json). There is NO hardcoded
-infrastructure in this file - point it at your OWN hardware via config.json.
+Everything site-specific lives in config.json (gitignored). See config.example.json
+and README.md. Python 3.8+ standard library only; the web UI is a prebuilt Vite app
+in web/dist.
 
-Architecture
-------------
-Each node is polled over SSH on its own staggered background timer (remote SSH is
-slow, so the cadence is gentle and never blocks the others). Each configured model
-endpoint is scraped over HTTP (Prometheus /metrics + /v1/models) on its own timer.
-The latest result is cached in memory; the browser polls /api/metrics on a short
-cadence and reads that cache. Per-GPU temp/power history is kept for sparklines.
-
-READ-ONLY. Every command here only QUERIES state (nvidia-smi query, /proc, hwmon,
-HTTP GET on the model /metrics endpoints). Nothing restarts, reconfigures, or kills
-anything. Unreachable nodes/models degrade to "stale"; a poller never crashes.
-
-Requires only the Python 3.8+ standard library.
+Monitoring is READ-ONLY. Every remote command only queries state (nvidia-smi query,
+/proc, RouterOS print/monitor). The few write-capable routes (GPU clock caps, key
+lights) are refused while server.read_only is true, which is the default.
 """
 
+import datetime
 import json
+import mimetypes
 import os
 import re
+import shlex
 import subprocess
+import sys
 import threading
-import urllib.parse
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+VERSION = "2.0.0"
+
 
 # ----------------------------------------------------------------------------
-# Config loading
+# Config
 # ----------------------------------------------------------------------------
-# All infrastructure comes from a JSON config file. See config.example.json and
-# the README for the full schema. Load it once at startup and normalize defaults.
-
 DEFAULTS = {
     "server": {
-        "title": "Sparky Command Center",
-        "subtitle": "DGX Spark fleet + GPU boxes - GPU / CPU / mem / temp / power + per-model decode, prefill, TTFT",
-        "bind": "0.0.0.0",
-        "port": 8890,
+        "title": "Command Center",
+        "subtitle": "Self-hosted AI fleet",
+        "location": "",
+        "timezone": "",                 # IANA name for the UI clock + chat, e.g. America/New_York
+        "bind": ["127.0.0.1"],          # one address or a list
+        "port": 8895,
+        "allowed_hosts": [],            # extra Host header names allowed to POST (tailnet names)
+        "read_only": True,              # refuse every write route (clock caps, key lights)
+        "static_dir": "web/dist",
         "browser_refresh_ms": 2500,
-        # Cumulative token-served tracker. vLLM/llama.cpp expose prompt/generation
-        # token counters that RESET on server restart; when enabled we bank the
-        # deltas into token_store so a restart never zeroes the running history.
-        # Works for every configured model with no extra config. Set false to skip.
-        "token_tracking": True,
-        "token_store": "data/token_usage.json",
     },
     "ssh": {
-        "default_key": "~/.ssh/id_ed25519",
+        "default_key": "",
         "connect_timeout": 8,
-        # Extra `-o Key=Value` options applied to every ssh call. BatchMode=yes so
-        # a node that would prompt for a password fails fast instead of hanging.
-        "options": {
-            "IdentitiesOnly": "yes",
-            "BatchMode": "yes",
-            "StrictHostKeyChecking": "accept-new",
-        },
+        "options": {"IdentitiesOnly": "yes", "BatchMode": "yes",
+                    "StrictHostKeyChecking": "accept-new"},
     },
-    "defaults": {
-        "poll_interval": 6.0,        # seconds between node polls
-        "model_poll_interval": 6.0,  # seconds between model /metrics scrapes
-        "temp_warn": 70,             # deg C -> yellow pill
-        "temp_hot": 84,              # deg C -> red pill
+    "defaults": {"poll_interval": 7.0, "model_poll_interval": 6.0,
+                 "temp_warn": 70, "temp_hot": 84, "stale_after_s": 20},
+    "nodes": [],
+    "sections": [],
+    "switch": None,
+    "models": [],
+    "comfy_lanes": [],
+    "comfy_poll_seconds": 4.0,
+    "tokens": {"enabled": True, "mode": "bank", "store": "data/token_usage.json",
+               "poll_seconds": 120, "order": [], "models": []},
+    "eco": {"enabled": False, "allow_writes": False, "levels": [], "info_url": ""},
+    "stations": {"enabled": False, "items": []},
+    "keylights": {"enabled": False, "url": ""},
+    "chat": {
+        "enabled": True,
+        "name": "Jarvis",
+        "base_url": "",
+        "model": "",
+        "api_key": "",
+        "system_prompt": "",
+        "temperature": 0.1,
+        "max_tokens": 1200,
+        "timeout": 180,
+        "history_turns": 12,
+        "grounding": True,
+        "extra_body": {},
+        "fallbacks": [],
+        "suggestions": ["What is down right now?", "Which node is running hottest?",
+                        "How fast is each model decoding?"],
     },
 }
 
-HIST_LEN = 60  # last N samples per GPU for the sparkline
 
-
-def _deep_merge(base, override):
-    """Return base updated by override (nested dicts merged, not replaced)."""
+def _deep_merge(base, over):
     out = dict(base)
-    for k, v in (override or {}).items():
+    for k, v in (over or {}).items():
+        if k.startswith("_"):
+            continue
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = _deep_merge(out[k], v)
         else:
@@ -88,143 +103,90 @@ def _deep_merge(base, override):
     return out
 
 
-def load_config(path=None):
-    """Load and normalize config.json. Builds the flat NODES + MODELS lists the
-    pollers iterate over. Every node/model gets a stable key and inherits the
-    global defaults where a per-item value is not set."""
-    path = path or os.environ.get("CONFIG", "config.json")
-    with open(path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-
-    # Expand ${VAR} placeholders from the environment (e.g. auth tokens).
-    # Leaves unknown vars as-is rather than failing — configs must stay runnable
-    # on hosts that don't export every secret.
-    def _expand(obj):
-        if isinstance(obj, str):
-            return re.sub(
-                r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}",
-                lambda m: os.environ.get(m.group(1), m.group(0)),
-                obj,
-            )
-        if isinstance(obj, dict):
-            return {k: _expand(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_expand(v) for v in obj]
-        return obj
-
-    raw = _expand(raw)
-
-    cfg = {
-        "server": _deep_merge(DEFAULTS["server"], raw.get("server")),
-        "ssh": _deep_merge(DEFAULTS["ssh"], raw.get("ssh")),
-        "defaults": _deep_merge(DEFAULTS["defaults"], raw.get("defaults")),
-    }
-    cfg["ssh"]["default_key"] = os.path.expanduser(cfg["ssh"]["default_key"])
-
-    d = cfg["defaults"]
-    nodes = []
-    models = []
-    for ni, node in enumerate(raw.get("nodes", [])):
-        if node.get("name", "").startswith("_"):  # allow "_comment" pseudo-nodes
-            continue
-        name = node.get("name") or node.get("host") or f"node{ni + 1}"
-        key = node.get("key") or re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower() or f"node{ni + 1}"
-        n = {
-            "key": key,
-            "name": name,
-            "host": node["host"],
-            "user": node.get("user", os.environ.get("USER", "root")),
-            "port": node.get("port"),
-            "ssh_key": os.path.expanduser(node["ssh_key"]) if node.get("ssh_key") else cfg["ssh"]["default_key"],
-            "jump_host": node.get("jump_host"),
-            "jump_user": node.get("jump_user"),
-            "poll_interval": float(node.get("poll_interval", d["poll_interval"])),
-            "temp_warn": node.get("temp_warn", d["temp_warn"]),
-            "temp_hot": node.get("temp_hot", d["temp_hot"]),
-        }
-        nodes.append(n)
-        for mi, m in enumerate(node.get("models", []) or []):
-            models.append(_norm_model(m, node=key, node_name=name, idx=mi, defaults=d))
-
-    # Fleet-wide model instances that are not tied to a single node (e.g. run two
-    # instances across the cluster and watch both). Rendered in their own section.
-    for mi, m in enumerate(raw.get("models", []) or []):
-        models.append(_norm_model(m, node=None, node_name=None, idx=mi, defaults=d))
-
-    # Optional fabric-switch panel. Omit the top-level "switch" block to hide it.
-    sw_raw = raw.get("switch")
-    switch = None
-    if sw_raw and sw_raw.get("host"):
-        switch = {
-            "key": "switch",
-            "name": sw_raw.get("name", "Fabric Switch"),
-            "badge": sw_raw.get("badge", "RoCE FABRIC"),
-            "host": sw_raw["host"],
-            "user": sw_raw.get("user", "admin"),
-            "port": sw_raw.get("port"),
-            "ssh_key": os.path.expanduser(sw_raw["ssh_key"]) if sw_raw.get("ssh_key") else cfg["ssh"]["default_key"],
-            "jump_host": sw_raw.get("jump_host"),
-            "jump_user": sw_raw.get("jump_user"),
-            "poll_interval": float(sw_raw.get("poll_interval", 8.0)),
-            "ports": sw_raw.get("ports") or [],   # fabric interfaces to show; [] = auto-detect running
-            "temp_warn": sw_raw.get("temp_warn", 55),
-            "temp_hot": sw_raw.get("temp_hot", 70),
-        }
-
-    # Optional ComfyUI-style image/video lanes. `url` is the only required
-    # field; everything else falls back so a minimal entry still renders.
-    lanes = []
-    for li, ln in enumerate(raw.get("comfy_lanes", []) or []):
-        if not ln.get("url"):
-            continue
-        key = ln.get("key") or re.sub(r"[^a-zA-Z0-9]+", "-",
-                                      ln.get("name") or f"lane{li + 1}").strip("-").lower()
-        lanes.append({
-            "key": key,
-            "lane": ln.get("lane") or str(li + 1),
-            "name": ln.get("name") or key,
-            "host": ln.get("host", ""),
-            "url": ln["url"].rstrip("/"),
-        })
-
-    cfg["nodes"] = nodes
-    cfg["models"] = models
-    cfg["switch"] = switch
-    cfg["comfy_lanes"] = lanes
-    return cfg
+def _load_env_file(path):
+    """Minimal KEY=VALUE .env loader. Never overrides a variable already set."""
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except FileNotFoundError:
+        pass
 
 
-def _norm_model(m, node, node_name, idx, defaults):
-    """Normalize one model definition. `node` is the owning node key, or None for
-    a fleet-wide instance."""
-    prefix = node or "fleet"
-    mkey = m.get("key") or f"{prefix}:m{idx}"
-    return {
-        "key": mkey,
-        "node": node,
-        "node_name": node_name,
-        "group": m.get("group") or ("Fleet models" if node is None else None),
-        "label": m.get("label") or m.get("model") or mkey,
-        "endpoint": m["endpoint"].rstrip("/"),
-        "port": m.get("port"),
-        "model": m.get("model"),   # optional served-alias to prefer on /v1/models
-        "gpus": m.get("gpus"),      # optional human label, e.g. "GPU 0-1"
-        "poll_interval": float(m.get("poll_interval", defaults["model_poll_interval"])),
-        "auth_token": m.get("auth_token"),  # optional Bearer token for gated endpoints
-    }
+def _abs(path):
+    if not path:
+        return path
+    path = os.path.expanduser(path)
+    return path if os.path.isabs(path) else os.path.join(HERE, path)
 
 
-CFG = None  # populated in main()
+def load_config():
+    _load_env_file(os.path.join(HERE, ".env"))
+    path = os.environ.get("CC_CONFIG") or os.path.join(HERE, "config.json")
+    raw, used = {}, None
+    if os.path.exists(path):
+        with open(path) as f:
+            raw = json.load(f)
+        used = path
+    cfg = _deep_merge(DEFAULTS, raw)
+    env = os.environ
+    chat = cfg["chat"]
+    if env.get("CC_CHAT_BASE_URL"):
+        chat["base_url"] = env["CC_CHAT_BASE_URL"]
+    if env.get("CC_CHAT_MODEL"):
+        chat["model"] = env["CC_CHAT_MODEL"]
+    if env.get("CC_CHAT_API_KEY"):
+        chat["api_key"] = env["CC_CHAT_API_KEY"]
+    if env.get("CC_CHAT_SYSTEM_PROMPT"):
+        chat["system_prompt"] = env["CC_CHAT_SYSTEM_PROMPT"]
+    if env.get("CC_CHAT_NAME"):
+        chat["name"] = env["CC_CHAT_NAME"]
+    if chat.get("api_key_file") and not chat.get("api_key"):
+        try:
+            with open(_abs(chat["api_key_file"])) as f:
+                chat["api_key"] = f.read().strip()
+        except Exception:
+            pass
+    if env.get("CC_PORT"):
+        cfg["server"]["port"] = int(env["CC_PORT"])
+    if env.get("CC_BIND"):
+        cfg["server"]["bind"] = [b.strip() for b in env["CC_BIND"].split(",") if b.strip()]
+    if env.get("CC_READ_ONLY"):
+        cfg["server"]["read_only"] = env["CC_READ_ONLY"].lower() not in ("0", "false", "no")
+    if isinstance(cfg["server"]["bind"], str):
+        cfg["server"]["bind"] = [cfg["server"]["bind"]]
+    return cfg, used
+
+
+CFG, CFG_PATH = load_config()
+READ_ONLY = bool(CFG["server"]["read_only"])
+NODES = CFG["nodes"]
+NODE_BY_KEY = {n["key"]: n for n in NODES}
+MODELS = CFG["models"]
+COMFY_LANES = CFG["comfy_lanes"]
+SWITCH = CFG["switch"] if (CFG.get("switch") or {}).get("enabled", True) and CFG.get("switch") else None
+HIST_LEN = 60
 
 
 # ----------------------------------------------------------------------------
-# Shared state (one slice per node/model; each poller writes its own slice)
+# Shared state
 # ----------------------------------------------------------------------------
 _lock = threading.Lock()
-STATE = {"nodes": {}, "models": {}, "switch": None, "comfy": {}}
-_hist = {}  # sparkline history, keyed e.g. "node:<nodekey>:<gpuindex>:temp"
-_iface_prev = {}  # switch interface byte counters for throughput deltas: (swkey,port) -> (ts,rx,tx)
-_port_rate = {}   # switch static port link rate cache: (swkey,port) -> "100Gbps"
+STATE = {
+    "nodes": {n["key"]: {"key": n["key"], "name": n.get("name", n["key"]),
+                         "profile": n.get("profile", "discrete"),
+                         "reachable": False, "ts": 0, "err": "warming up"} for n in NODES},
+    "switch": {"reachable": False, "ts": 0, "err": "warming up"},
+    "models": {},
+    "comfy": {},
+}
+_hist = {}
 
 
 def _push_hist(key, value):
@@ -253,150 +215,199 @@ def _num(v):
         return None
 
 
-# ----------------------------------------------------------------------------
-# Clock ECO mode (optional): cap GPU clocks per node or fleet-wide over SSH.
-# Useful on DGX Spark / GB10 boxes, where a clock cap tames thermal hard-offs
-# and cuts power ~30% with little decode cost (LLM decode is memory-bound).
-# See https://github.com/tonyd2wild/DGX-Spark-Hard-Poweroff-Fix for the story.
-#
-# Writes are DISABLED until you create an `eco_key.txt` file next to server.py
-# containing a secret of your choice; the UI asks for it once per browser.
-# Status reads are always available. Nodes need passwordless sudo for
-# `nvidia-smi -lgc` / `-rgc` (or run the dashboard as a user that has it).
-# ----------------------------------------------------------------------------
-ECO_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eco_key.txt")
-ECO_LEVELS = {"2300": "0,2300", "2200": "0,2200", "2000": "0,2000", "1800": "0,1800"}
-
-
-def _eco_ssh(node, remote_cmd, timeout=25):
-    argv = ["ssh"] + _ssh_flags(node) + [f"{node['user']}@{node['host']}", remote_cmd]
-    rc, out, err = _run(argv, timeout=timeout)
-    return (out or err or "").strip()
-
-
-def _eco_key_ok(supplied):
+def _http_get(url, timeout=6, headers=None):
+    """Stdlib GET. Returns (ok, text). Never raises."""
     try:
-        want = open(ECO_KEY_FILE).read().strip()
+        h = {"User-Agent": "command-center-v2"}
+        h.update(headers or {})
+        req = urllib.request.Request(url, headers=h)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return True, r.read().decode("utf-8", "replace")
     except Exception:
-        return False
-    return bool(want) and (supplied or "").strip() == want
+        return False, ""
 
 
-def eco_status():
-    out = {}
-
-    def one(n):
-        v = _eco_ssh(n, "nvidia-smi --query-gpu=clocks.gr,temperature.gpu,power.draw "
-                        "--format=csv,noheader 2>/dev/null", timeout=20)
-        out[n["key"]] = v.split("\n")[0][:60] if v else "no reply"
-
-    ts = [threading.Thread(target=one, args=(n,)) for n in CFG["nodes"]]
-    [t.start() for t in ts]
-    [t.join(28) for t in ts]
-    return out
+def _http_status(url, timeout=3):
+    """Any HTTP answer counts as up (a 404 still means the server is listening)."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "command-center-v2"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return 0
 
 
-def eco_set(node_key, level):
-    cmd = ("sudo nvidia-smi -rgc" if level == "off"
-           else "sudo nvidia-smi -lgc " + ECO_LEVELS[level])
-    targets = CFG["nodes"] if node_key == "fleet" else [n for n in CFG["nodes"] if n["key"] == node_key]
-    out = {}
-
-    def one(n):
-        out[n["key"]] = (_eco_ssh(n, cmd, timeout=30) or "ok")[:120]
-
-    ts = [threading.Thread(target=one, args=(n,)) for n in targets]
-    [t.start() for t in ts]
-    [t.join(35) for t in ts]
-    return out, bool(targets)
+def _http_post(url, data, timeout=8):
+    try:
+        req = urllib.request.Request(url, data=data, method="POST",
+                                     headers={"Content-Type": "application/json",
+                                              "User-Agent": "command-center-v2"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read().decode("utf-8", "replace")
+        except Exception:
+            return e.code, ""
+    except Exception as e:  # noqa
+        return 0, str(e)[:140]
 
 
 # ----------------------------------------------------------------------------
-# Node poller (one SSH round-trip per node: GPUs + CPU temps + system memory)
+# SSH
 # ----------------------------------------------------------------------------
-# nvidia-smi query for every GPU, CPU temps from hwmon (AMD k10temp / Intel
-# coretemp / ARM cpu_thermal / etc.), and system RAM from `free`. All READ-ONLY.
-_NODE_REMOTE = (
-    'nvidia-smi --query-gpu=index,name,temperature.gpu,power.draw,power.limit,'
-    'utilization.gpu,memory.used,memory.total,fan.speed,clocks.gr,clocks.mem '
-    '--format=csv,noheader,nounits 2>/dev/null; '
-    'echo PIPECPU; '
-    'for h in /sys/class/hwmon/hwmon*; do n=$(cat "$h/name" 2>/dev/null); '
-    'case "$n" in k10temp|coretemp|cpu_thermal|zenpower|nct6*|acpitz) '
-    'cat "$h"/temp*_input 2>/dev/null;; esac; done; '
-    'echo PIPEMEM; '
-    'LC_ALL=C free -m | awk "/^Mem:/{print \\$2, \\$3}"'
-)
-
-
-def _ssh_flags(node):
-    """Build the shared ssh flag list for a node: identity, timeout, options,
-    optional port, optional ProxyJump bastion. Flags must be SEPARATE argv items."""
-    flags = ["-i", node["ssh_key"], "-o", f"ConnectTimeout={CFG['ssh']['connect_timeout']}"]
-    for k, v in (CFG["ssh"].get("options") or {}).items():
-        # Value prefixed with @ is a RAW flag (e.g. "@-F /path" -> -F /path),
-        # not an -o Key=Value. Split on whitespace so each token is its own
-        # argv item. Lets deployments point ssh at a specific config file.
-        if isinstance(v, str) and v.startswith("@"):
-            flags += v[1:].split()
-        else:
-            flags += ["-o", f"{k}={v}"]
-    if node.get("port"):
-        flags += ["-p", str(node["port"])]
-    if node.get("jump_host"):
-        jump = node["jump_host"]
-        if node.get("jump_user"):
-            jump = f"{node['jump_user']}@{jump}"
-        flags += ["-J", jump]  # standard SSH ProxyJump / bastion
+def _ssh_flags(obj):
+    s = CFG["ssh"]
+    flags = []
+    key = obj.get("ssh_key") or s.get("default_key")
+    if key:
+        flags += ["-i", os.path.expanduser(key)]
+    for k, v in (s.get("options") or {}).items():
+        flags += ["-o", "%s=%s" % (k, v)]
+    flags += ["-o", "ConnectTimeout=%s" % int(obj.get("connect_timeout") or s.get("connect_timeout") or 8)]
+    if obj.get("ssh_port"):
+        flags += ["-p", str(obj["ssh_port"])]
     return flags
 
 
-def _node_cmd(node):
-    return ["ssh"] + _ssh_flags(node) + [f"{node['user']}@{node['host']}", _NODE_REMOTE]
+def _target(obj):
+    return "%s@%s" % (obj["user"], obj["host"]) if obj.get("user") else obj["host"]
 
 
-def poll_node(node):
+def remote_argv(node, script):
+    """argv that runs `script` on a node. Three reach modes:
+      direct             ssh user@host script
+      jump.mode=proxy    ssh -J jumpuser@jump user@host script
+      jump.mode=nested   ssh jumpuser@jump "ssh user@host 'script'"  (the jump host's own
+                         key reaches the LAN node; use when only the jump host is trusted)
+    """
+    jump = node.get("jump")
+    if not jump:
+        return ["ssh"] + _ssh_flags(node) + [_target(node), script]
+    jt = _target(jump)
+    if jump.get("mode", "nested") in ("proxy", "proxyjump"):
+        return ["ssh"] + _ssh_flags(node) + ["-J", jt, _target(node), script]
+    inner = ("ssh -o BatchMode=yes -o ConnectTimeout=6 %s %s"
+             % (shlex.quote(_target(node)), shlex.quote(script)))
+    jflags = _ssh_flags({"ssh_key": jump.get("ssh_key") or node.get("ssh_key"),
+                         "ssh_port": jump.get("ssh_port")})
+    return ["ssh"] + jflags + [jt, inner]
+
+
+# ----------------------------------------------------------------------------
+# Node pollers
+#   profile "unified": one GPU sharing system RAM (DGX Spark / GB10, Jetson-class).
+#     nvidia-smi has no memory fields there, so /proc/meminfo IS the GPU memory.
+#   profile "discrete": a host with one or more PCIe GPUs (RTX, A-series ...).
+# ----------------------------------------------------------------------------
+_UNIFIED_REMOTE = (
+    'nvidia-smi --query-gpu=temperature.gpu,power.draw,utilization.gpu,'
+    'clocks.current.sm --format=csv,noheader,nounits; '
+    'echo PIPEMEM; '
+    'grep -E "^(MemTotal|MemAvailable):" /proc/meminfo; '
+    'echo PIPEAPP; '
+    'nvidia-smi --query-compute-apps=used_memory --format=csv,noheader,nounits | paste -sd+ | bc'
+)
+
+
+def _discrete_remote(containers):
+    s = ('nvidia-smi --query-gpu=index,name,temperature.gpu,power.draw,power.limit,'
+         'utilization.gpu,memory.used,memory.total,fan.speed,clocks.gr,clocks.mem '
+         '--format=csv,noheader,nounits; '
+         'echo PIPECPU; '
+         'for h in /sys/class/hwmon/hwmon*; do n=$(cat $h/name 2>/dev/null); '
+         'if [ "$n" = "k10temp" ] || [ "$n" = "coretemp" ] || [ "$n" = "zenpower" ]; then '
+         'cat $h/temp*_input 2>/dev/null; break; fi; done; '
+         'echo PIPEMEM; free -m | awk "/^Mem:/{print \\$2, \\$3}"; '
+         'echo PIPEDOCKER; ')
+    if containers:
+        s += 'docker ps --format "{{.Names}}" 2>/dev/null'
+    return s
+
+
+def poll_unified(node):
     res = {
-        "key": node["key"], "name": node["name"], "reachable": False,
+        "key": node["key"], "name": node.get("name", node["key"]), "profile": "unified",
+        "node_id": node.get("node_id"), "rank": node.get("rank"), "reachable": False,
+        "temp": None, "power": None, "util": None, "sm_clock": None,
+        "mem_total_gib": None, "mem_used_gib": None, "mem_pct": None,
+        "model_gib": None, "model": node.get("serving"), "pair": node.get("pair"),
         "ts": time.time(), "err": None,
-        "gpus": [], "cpu_temp": None, "cpu_temps": [],
-        "mem_total_mb": None, "mem_used_mb": None, "mem_pct": None,
-        "temp_warn": node["temp_warn"], "temp_hot": node["temp_hot"],
     }
-    timeout = max(10, node["poll_interval"] * 2 + 4)
-    rc, out, err = _run(_node_cmd(node), timeout=timeout)
+    rc, out, err = _run(remote_argv(node, _UNIFIED_REMOTE), timeout=16)
+    if rc != 0 or not out.strip():
+        res["err"] = (err or "no output").strip()[:140]
+        return res
+    try:
+        gpu_part, _, rest = out.partition("PIPEMEM")
+        mem_part, _, app_part = rest.partition("PIPEAPP")
+        gline = gpu_part.strip().splitlines()
+        if gline:
+            f = [x.strip() for x in gline[0].split(",")]
+            res["temp"] = _num(f[0]) if len(f) > 0 else None
+            res["power"] = _num(f[1]) if len(f) > 1 else None
+            res["util"] = _num(f[2]) if len(f) > 2 else None
+            res["sm_clock"] = _num(f[3]) if len(f) > 3 else None
+        tot_kb = avail_kb = None
+        for line in mem_part.strip().splitlines():
+            mm = re.match(r"(MemTotal|MemAvailable):\s+(\d+)", line.strip())
+            if not mm:
+                continue
+            if mm.group(1) == "MemTotal":
+                tot_kb = float(mm.group(2))
+            else:
+                avail_kb = float(mm.group(2))
+        if tot_kb:
+            used_kb = tot_kb - (avail_kb or 0)
+            res["mem_total_gib"] = round(tot_kb / 1048576.0, 1)
+            res["mem_used_gib"] = round(used_kb / 1048576.0, 1)
+            res["mem_pct"] = round(used_kb / tot_kb * 100.0, 1)
+        app_mib = _num(app_part.strip().splitlines()[0]) if app_part.strip() else None
+        if app_mib is not None:
+            res["model_gib"] = round(app_mib / 1024.0, 1)
+        res["reachable"] = res["temp"] is not None
+        if not res["reachable"]:
+            res["err"] = "no GPU reading"
+    except Exception as e:  # noqa
+        res["err"] = ("parse: %s" % e)[:140]
+    return res
+
+
+def poll_discrete(node):
+    res = {"key": node["key"], "name": node.get("name", node["key"]), "profile": "discrete",
+           "host_label": node.get("badge") or "GPU HOST",
+           "reachable": False, "ts": time.time(), "err": None,
+           "gpus": [], "cpu_temp": None, "cpu_temps": [],
+           "mem_total_mb": None, "mem_used_mb": None, "mem_pct": None, "models": []}
+    labels = node.get("containers") or {}
+    rc, out, err = _run(remote_argv(node, _discrete_remote(bool(node.get("list_containers", True)))),
+                        timeout=14)
     if rc != 0 or not out.strip():
         res["err"] = (err or "no output").strip()[:140]
         return res
     try:
         gpu_part, _, rest = out.partition("PIPECPU")
-        cpu_part, _, mem_part = rest.partition("PIPEMEM")
-
+        cpu_part, _, rest2 = rest.partition("PIPEMEM")
+        mem_part, _, docker_part = rest2.partition("PIPEDOCKER")
         for line in gpu_part.strip().splitlines():
             f = [x.strip() for x in line.split(",")]
             if len(f) < 11:
                 continue
             idx = int(f[0])
             fan = _num(f[8]) if f[8].replace(".", "").isdigit() else None
-            g = {
-                "index": idx,
-                "name": re.sub(r"^NVIDIA\s+(GeForce\s+)?", "", f[1]),
-                "temp": _num(f[2]), "power": _num(f[3]), "power_limit": _num(f[4]),
-                "util": _num(f[5]),
-                "mem_used_mb": _num(f[6]), "mem_total_mb": _num(f[7]),
-                "fan": fan, "gr_clock": _num(f[9]), "mem_clock": _num(f[10]),
-            }
+            g = {"index": idx, "name": f[1].replace("NVIDIA GeForce ", ""),
+                 "temp": _num(f[2]), "power": _num(f[3]), "power_limit": _num(f[4]),
+                 "util": _num(f[5]), "mem_used_mb": _num(f[6]), "mem_total_mb": _num(f[7]),
+                 "fan": fan, "gr_clock": _num(f[9]), "mem_clock": _num(f[10])}
             if g["mem_total_mb"]:
                 g["mem_pct"] = round((g["mem_used_mb"] or 0) / g["mem_total_mb"] * 100.0, 1)
             res["gpus"].append(g)
-            _push_hist(f"node:{node['key']}:{idx}:temp", g["temp"])
-            _push_hist(f"node:{node['key']}:{idx}:power", g["power"])
-
         cpu_vals = [int(x) / 1000.0 for x in cpu_part.strip().splitlines() if x.strip().isdigit()]
         if cpu_vals:
-            res["cpu_temps"] = sorted((round(v, 1) for v in cpu_vals), reverse=True)
+            res["cpu_temps"] = [round(v, 1) for v in cpu_vals]
             res["cpu_temp"] = res["cpu_temps"][0]
-
         ml = mem_part.strip().splitlines()
         if ml:
             parts = ml[0].split()
@@ -405,33 +416,65 @@ def poll_node(node):
                 res["mem_used_mb"] = _num(parts[1])
                 if res["mem_total_mb"]:
                     res["mem_pct"] = round(res["mem_used_mb"] / res["mem_total_mb"] * 100.0, 1)
-
-        res["reachable"] = bool(res["gpus"]) or res["mem_total_mb"] is not None
+        for name in [n.strip() for n in docker_part.strip().splitlines() if n.strip()]:
+            meta = labels.get(name)
+            if meta:
+                res["models"].append({"name": name, "label": meta.get("label", name),
+                                      "port": meta.get("port"), "gpus": meta.get("gpus"), "up": True})
+            else:
+                res["models"].append({"name": name, "label": name, "up": True})
+        res["reachable"] = len(res["gpus"]) > 0
         if not res["reachable"]:
-            res["err"] = "no GPU/mem reading"
+            res["err"] = "no GPUs reported"
     except Exception as e:  # noqa
-        res["err"] = f"parse: {e}"[:140]
+        res["err"] = ("parse: %s" % e)[:140]
     return res
 
 
-# ----------------------------------------------------------------------------
-# Optional fabric-switch poller (MikroTik / RouterOS over SSH). READ-ONLY.
-# ----------------------------------------------------------------------------
-# The switch is reached over plain SSH using the same key/jump-host mechanism as
-# nodes. RouterOS runs the command passed as the SSH argv and prints the result.
-# All commands only QUERY state (`print` / `monitor once`). Omit the config
-# "switch" block entirely to disable this panel.
-def _switch_ssh(sw, statement):
-    return ["ssh"] + _ssh_flags(sw) + [f"{sw['user']}@{sw['host']}", statement]
+def _node_loop(node, offset):
+    time.sleep(offset)
+    interval = float(node.get("poll_interval") or CFG["defaults"]["poll_interval"])
+    while True:
+        try:
+            r = poll_unified(node) if node.get("profile") == "unified" else poll_discrete(node)
+        except Exception as e:  # noqa
+            r = {"key": node["key"], "name": node.get("name"), "profile": node.get("profile"),
+                 "reachable": False, "ts": time.time(), "err": str(e)[:140], "gpus": []}
+        with _lock:
+            STATE["nodes"][node["key"]] = r
+            if r.get("reachable"):
+                if r.get("profile") == "unified":
+                    _push_hist("spark:%s:temp" % node["key"], r.get("temp"))
+                    _push_hist("spark:%s:power" % node["key"], r.get("power"))
+                else:
+                    for g in r.get("gpus") or []:
+                        _push_hist("gpu:%s:%s:temp" % (node["key"], g["index"]), g.get("temp"))
+                        _push_hist("gpu:%s:%s:power" % (node["key"], g["index"]), g.get("power"))
+        time.sleep(interval)
 
 
-def _strip_thousands(s):
-    """RouterOS prints byte counters with space thousands separators."""
-    return s.replace(" ", "")
+# ----------------------------------------------------------------------------
+# Fabric switch (MikroTik RouterOS). One statement per call, no retry spam.
+# Reach it with plain SSH (switch.host/user/ssh_key) or a custom command
+# (switch.exec.argv with a "{cmd}" placeholder, e.g. an expect helper).
+# ----------------------------------------------------------------------------
+_iface_prev = {}
+_port_rate = {}
+
+
+def _switch_argv(statement):
+    ex = (SWITCH or {}).get("exec")
+    if ex and ex.get("argv"):
+        return [a.replace("{cmd}", statement) for a in ex["argv"]], _abs(ex.get("cwd")) if ex.get("cwd") else None
+    return ["ssh"] + _ssh_flags(SWITCH) + [_target(SWITCH), statement], None
+
+
+def _sw(statement, timeout=30):
+    argv, cwd = _switch_argv(statement)
+    return _run(argv, timeout=timeout, cwd=cwd)
 
 
 def _parse_health(text):
-    """Parse `/system health print` value rows: "  #  NAME  VALUE  TYPE"."""
     h = {}
     for line in text.splitlines():
         mm = re.match(r"\s*\d+\s+([a-z0-9\-]+)\s+([0-9.]+|ok|fail|critical|warning)\b", line)
@@ -441,7 +484,6 @@ def _parse_health(text):
 
 
 def _parse_resource(text):
-    """Parse `/system resource print` "key: value" rows."""
     r = {}
     for line in text.splitlines():
         mm = re.match(r"\s*([a-z0-9\-]+):\s+(.+?)\s*$", line)
@@ -450,108 +492,76 @@ def _parse_resource(text):
     return r
 
 
-def _parse_iface_stats(text):
-    """Best-effort parse of `/interface print stats` rows -> {name: (rx, tx)}.
-    Byte counters use single-space thousands separators, columns use 2+ spaces."""
-    out = {}
-    for line in text.splitlines():
-        s = line.strip()
-        if not s or not s[0].isdigit():
-            continue  # data rows start with an index number
-        m = re.match(r"\d+\s+(?:[A-Z]{1,3}\s+)?([A-Za-z][\w\-]*)\s+(.*)$", s)
-        if not m:
-            continue
-        cols = re.split(r"\s{2,}", m.group(2).strip())
-        vals = [int(_strip_thousands(c)) for c in cols if _strip_thousands(c).isdigit()]
-        if len(vals) >= 2:
-            out[m.group(1)] = (vals[0], vals[1])
-    return out
-
-
-def poll_switch(sw):
-    res = {"reachable": False, "name": sw["name"], "badge": sw["badge"],
-           "ts": time.time(), "err": None, "health": {}, "resource": {},
-           "ports": [], "total_bps": 0,
-           "temp_warn": sw["temp_warn"], "temp_hot": sw["temp_hot"]}
-    to = max(20, sw["poll_interval"] * 2 + 6)
-
-    # 1) health (temps / fans / psu)
-    rc, out, err = _run(_switch_ssh(sw, "/system health print"), timeout=to)
+def poll_switch():
+    ports_cfg = SWITCH.get("ports") or []
+    res = {"reachable": False, "ts": time.time(), "err": None,
+           "health": {}, "resource": {}, "ports": [], "total_bps": 0}
+    rc, out, err = _sw("/system health print")
     if rc != 0 or "NAME" not in out:
         res["err"] = (err or out or "switch unreachable").strip()[:140]
         return res
     res["health"] = _parse_health(out)
-    res["reachable"] = True
-
-    # 2) resource (version / uptime / cpu)
-    rc, out, err = _run(_switch_ssh(sw, "/system resource print"), timeout=to)
+    rc, out, err = _sw("/system/resource/print")
     if rc == 0 and "version" in out:
         res["resource"] = _parse_resource(out)
-
-    # 3) interface byte counters -> live per-port throughput
-    rc, out, err = _run(_switch_ssh(sw, "/interface print stats where running"), timeout=to)
+    rc, out, err = _sw("/interface print stats where running")
     now = time.time()
-    stats = _parse_iface_stats(out) if rc == 0 else {}
-    names = sw["ports"] or list(stats.keys())
-    ports = {}
-    for p in names:
-        d = stats.get(p)
-        entry = {"name": p, "running": d is not None, "rx_bps": 0, "tx_bps": 0,
-                 "rate": _port_rate.get((sw["key"], p))}
-        if d:
-            rx, tx = d
-            prev = _iface_prev.get((sw["key"], p))
-            if prev:
-                dt = now - prev[0]
-                if dt > 0:
-                    entry["rx_bps"] = max(0, (rx - prev[1]) * 8 / dt)
-                    entry["tx_bps"] = max(0, (tx - prev[2]) * 8 / dt)
-            _iface_prev[(sw["key"], p)] = (now, rx, tx)
-        ports[p] = entry
-
-    # Fetch each running port's static link rate once (one monitor per cycle so we
-    # never hammer the switch).
-    for p in names:
-        if ports[p]["running"] and _port_rate.get((sw["key"], p)) is None:
-            rc2, out2, _ = _run(_switch_ssh(sw, f"/interface ethernet monitor {p} once"), timeout=to)
+    ports = {p: {"name": p, "running": False, "rx_bps": 0, "tx_bps": 0,
+                 "rate": _port_rate.get(p)} for p in ports_cfg}
+    if rc == 0 and "RX-BYTE" in out:
+        for line in out.splitlines():
+            for p in ports_cfg:
+                if re.search(r"\b" + re.escape(p) + r"\b", line):
+                    after = line.split(p, 1)[1].strip()
+                    cols = re.split(r"\s{2,}", after)
+                    vals = [int(c.replace(" ", "")) for c in cols if c.replace(" ", "").isdigit()]
+                    if len(vals) >= 2:
+                        rx, tx = vals[0], vals[1]
+                        ports[p]["running"] = True
+                        prev = _iface_prev.get(p)
+                        if prev:
+                            dt = now - prev[0]
+                            if dt > 0:
+                                ports[p]["rx_bps"] = max(0, (rx - prev[1]) * 8 / dt)
+                                ports[p]["tx_bps"] = max(0, (tx - prev[2]) * 8 / dt)
+                        _iface_prev[p] = (now, rx, tx)
+                    break
+        res["reachable"] = True
+    for p in ports_cfg:
+        if ports[p]["running"] and _port_rate.get(p) is None:
+            rc2, out2, _ = _sw("/interface ethernet monitor %s once" % p)
             if rc2 == 0:
                 rm = re.search(r"\brate:\s*([0-9A-Za-z]+)", out2)
                 if rm:
-                    _port_rate[(sw["key"], p)] = rm.group(1)
+                    _port_rate[p] = rm.group(1)
                     ports[p]["rate"] = rm.group(1)
             break
-
-    res["ports"] = [ports[p] for p in names]
+    res["ports"] = [ports[p] for p in ports_cfg]
     res["total_bps"] = sum(pp["rx_bps"] + pp["tx_bps"] for pp in res["ports"])
     return res
 
 
+def _switch_loop():
+    time.sleep(0.5)
+    interval = float(SWITCH.get("poll_interval") or 8.0)
+    while True:
+        try:
+            r = poll_switch()
+        except Exception as e:  # noqa
+            r = {"reachable": False, "ts": time.time(), "err": str(e)[:140],
+                 "health": {}, "resource": {}, "ports": [], "total_bps": 0}
+        with _lock:
+            STATE["switch"] = r
+        time.sleep(interval)
+
+
 # ----------------------------------------------------------------------------
-# Per-model inference-server poller (vLLM + llama.cpp Prometheus /metrics)
+# Model servers: Prometheus /metrics + /v1/models (vLLM, SGLang, llama.cpp)
 # ----------------------------------------------------------------------------
-# Previous counter snapshots per model key -> (ts, prompt_tokens, gen_tokens,
-# ttft_sum, ttft_count) so we can compute decode/prefill tok/s as a RATE.
 _model_prev = {}
 
 
-def _http_get(url, timeout=6, auth_token=None):
-    """Tiny stdlib GET. Returns (ok, text). Never raises (down/idle is normal)."""
-    try:
-        import urllib.request
-        headers = {"User-Agent": "llm-fleet-monitor"}
-        if auth_token:
-            headers["Authorization"] = f"Bearer {auth_token}"
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return True, r.read().decode("utf-8", "replace")
-    except Exception:  # noqa
-        return False, ""
-
-
 def _prom_parse(text):
-    """Parse a Prometheus exposition text body into {metric_name: value}.
-    Labels are stripped - for single-engine servers each base metric appears once,
-    so the last value wins. Histogram _sum/_count keep their suffixes."""
     out = {}
     for line in text.splitlines():
         line = line.strip()
@@ -566,15 +576,12 @@ def _prom_parse(text):
     return out
 
 
-def _model_id(endpoint, prefer=None, timeout=6, auth_token=None):
-    """Live model id from /v1/models. If `prefer` is set and served here, use it;
-    otherwise fall back to data[0].id. Empty string if unavailable."""
-    ok, body = _http_get(endpoint + "/v1/models", timeout=timeout, auth_token=auth_token)
+def _model_id(url, prefer=None, timeout=6, headers=None):
+    ok, body = _http_get(url + "/v1/models", timeout=timeout, headers=headers)
     if not ok:
         return ""
     try:
-        data = json.loads(body).get("data", [])
-        ids = [str(x.get("id", "") or "") for x in data]
+        ids = [str(d.get("id", "") or "") for d in json.loads(body).get("data", [])]
         if prefer and prefer in ids:
             return prefer
         if ids:
@@ -585,153 +592,35 @@ def _model_id(endpoint, prefer=None, timeout=6, auth_token=None):
 
 
 def _kv_pct(val):
-    """vLLM kv/gpu cache usage is a 0-1 fraction (despite '_perc'); llama.cpp
-    kv_cache_usage_ratio is also 0-1. Normalize anything <=1 to a percentage."""
     if val is None:
         return None
     return round(val * 100.0, 1) if val <= 1.0 else round(val, 1)
 
 
-# ----------------------------------------------------------------------------
-# Cumulative token tracker (banks prompt/generation counters across restarts)
-# ----------------------------------------------------------------------------
-# vLLM (vllm:prompt_tokens_total / vllm:generation_tokens_total) and llama.cpp
-# (llamacpp:prompt_tokens_total / llamacpp:tokens_predicted_total) expose
-# monotonic token counters that RESET to 0 whenever the inference server
-# restarts. poll_model already reads these for the tok/s rate; here we bank the
-# deltas into a persistent JSON store so a restart never zeroes the running
-# history, plus a per-day bucket that rolls over at local midnight.
-TOKEN_STORE = None            # abs path, set in main() when token_tracking is on
-_tokens = {}                  # model key -> banked record
-_tokens_lock = threading.Lock()
-_tokens_dirty = False
-_tokens_last_save = 0.0
-TOKEN_SAVE_EVERY = 25.0       # seconds; throttle disk writes
+def _model_base(m):
+    return {"key": m["key"], "label": m.get("label", m["key"]), "unit": m.get("unit", "fleet"),
+            "port": m.get("port"), "gpus": m.get("gpus"), "node": m.get("node")}
 
 
-def _load_tokens():
-    global _tokens
-    if not TOKEN_STORE:
-        return
-    try:
-        with open(TOKEN_STORE, "r", encoding="utf-8") as f:
-            _tokens = json.load(f)
-    except Exception:  # noqa - missing/corrupt store just starts fresh
-        _tokens = {}
-
-
-def _save_tokens(force=False):
-    """Atomically persist the token store, throttled to TOKEN_SAVE_EVERY."""
-    global _tokens_dirty, _tokens_last_save
-    if not TOKEN_STORE:
-        return
-    now = time.time()
-    with _tokens_lock:
-        if not _tokens_dirty or (not force and now - _tokens_last_save < TOKEN_SAVE_EVERY):
-            return
-        snap = json.dumps(_tokens, indent=2)
-        _tokens_dirty = False
-        _tokens_last_save = now
-    try:
-        d = os.path.dirname(os.path.abspath(TOKEN_STORE))
-        if d:
-            os.makedirs(d, exist_ok=True)
-        tmp = TOKEN_STORE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(snap)
-        os.replace(tmp, TOKEN_STORE)
-    except Exception:  # noqa - never let a write error take down the poller
-        pass
-
-
-def _bank_counter(rec, cur, f_total, f_last, f_today):
-    """Accumulate one monotonic-with-resets counter into a total + today bucket."""
-    last = rec.get(f_last)
-    if last is None:
-        # First observation: seed the total with the current running-session value
-        # so the tracker shows real numbers immediately, but start today fresh
-        # (we cannot attribute the pre-existing count to today).
-        rec[f_total] = cur
-        rec[f_last] = cur
-        rec.setdefault(f_today, 0.0)
-        return
-    delta = (cur - last) if cur >= last else cur   # cur < last => server restarted
-    rec[f_total] = rec.get(f_total, 0.0) + delta
-    rec[f_today] = rec.get(f_today, 0.0) + delta
-    rec[f_last] = cur
-
-
-def bank_tokens(m, prompt_tok, gen_tok):
-    """Bank a model's cumulative token counters. Called from poll_model. No-op
-    when token tracking is disabled or the server exposes no token counters."""
-    global _tokens_dirty
-    if not TOKEN_STORE or (prompt_tok is None and gen_tok is None):
-        return
-    today = time.strftime("%Y-%m-%d", time.localtime())
-    with _tokens_lock:
-        rec = _tokens.setdefault(m["key"], {})
-        rec["label"] = m["label"]
-        rec["node"] = m.get("node_name") or m.get("node")
-        rec["gpus"] = m.get("gpus")
-        if rec.get("today_date") != today:      # roll the day bucket at midnight
-            rec["today_date"] = today
-            rec["today_prompt"] = 0.0
-            rec["today_gen"] = 0.0
-        if prompt_tok is not None:
-            _bank_counter(rec, prompt_tok, "total_prompt", "last_prompt", "today_prompt")
-        if gen_tok is not None:
-            _bank_counter(rec, gen_tok, "total_gen", "last_gen", "today_gen")
-        rec["total_tokens"] = rec.get("total_prompt", 0.0) + rec.get("total_gen", 0.0)
-        rec["today_tokens"] = rec.get("today_prompt", 0.0) + rec.get("today_gen", 0.0)
-        rec["ts"] = time.time()
-        _tokens_dirty = True
-    _save_tokens()
-
-
-def tokens_snapshot():
-    """Read-only view of the banked token store for the API/UI. Copies under the
-    token lock, then reads liveness under the node lock - never both at once."""
-    if not TOKEN_STORE:
-        return {"enabled": False, "models": [], "total": 0, "today": 0}
-    with _tokens_lock:
-        recs = [dict(v, key=k) for k, v in _tokens.items()]
-    with _lock:
-        for r in recs:
-            st = STATE["models"].get(r["key"]) or {}
-            r["reachable"] = bool(st.get("reachable"))
-    recs.sort(key=lambda r: r.get("total_tokens", 0), reverse=True)
-    return {
-        "enabled": True,
-        "models": recs,
-        "total": sum(r.get("total_tokens", 0) for r in recs),
-        "today": sum(r.get("today_tokens", 0) for r in recs),
-    }
+def _auth_headers(m):
+    k = m.get("api_key") or ""
+    return {"Authorization": "Bearer " + k} if k else None
 
 
 def poll_model(m):
-    """Scrape one model server's /metrics + /v1/models. Computes decode/prefill
-    tok/s as deltas between polls. Handles both vLLM and llama.cpp metric names."""
-    res = {
-        "key": m["key"], "node": m["node"], "label": m["label"],
-        "port": m["port"], "gpus": m.get("gpus"),
-        "reachable": False, "engine": None, "model": None,
-        "decode_tps": None, "prefill_tps": None, "ttft_ms": None,
-        "kv_pct": None, "running": None, "waiting": None,
-        "ts": time.time(), "err": None,
-    }
-    ok, body = _http_get(m["endpoint"] + "/metrics", timeout=6, auth_token=m.get("auth_token"))
+    res = _model_base(m)
+    res.update({"reachable": False, "engine": None, "model": None, "decode_tps": None,
+                "prefill_tps": None, "ttft_ms": None, "kv_pct": None, "running": None,
+                "waiting": None, "ts": time.time(), "err": None})
+    url = m["endpoint"].rstrip("/")
+    ok, body = _http_get(url + "/metrics", timeout=6, headers=_auth_headers(m))
     if not ok or not body.strip():
         res["err"] = "down / no /metrics"
         return res
     p = _prom_parse(body)
     now = time.time()
-
-    is_vllm = any(k.startswith("vllm:") for k in p)
-    is_llama = any(k.startswith("llamacpp:") for k in p)
-
     prompt_tok = gen_tok = ttft_sum = ttft_cnt = None
-
-    if is_vllm:
+    if any(k.startswith("vllm:") for k in p):
         res["engine"] = "vLLM"
         prompt_tok = p.get("vllm:prompt_tokens_total")
         gen_tok = p.get("vllm:generation_tokens_total")
@@ -745,7 +634,7 @@ def poll_model(m):
             res["running"] = int(p["vllm:num_requests_running"])
         if "vllm:num_requests_waiting" in p:
             res["waiting"] = int(p["vllm:num_requests_waiting"])
-    elif is_llama:
+    elif any(k.startswith("llamacpp:") for k in p):
         res["engine"] = "llama.cpp"
         prompt_tok = p.get("llamacpp:prompt_tokens_total")
         gen_tok = p.get("llamacpp:tokens_predicted_total")
@@ -754,24 +643,25 @@ def poll_model(m):
             res["running"] = int(p["llamacpp:requests_processing"])
         if "llamacpp:requests_deferred" in p:
             res["waiting"] = int(p["llamacpp:requests_deferred"])
-        # llama.cpp exposes instantaneous rates directly; use as a fallback.
-        inst_pred = p.get("llamacpp:predicted_tokens_seconds")
-        inst_proc = p.get("llamacpp:prompt_tokens_seconds")
-        if inst_pred is not None:
-            res["decode_tps"] = round(inst_pred, 1)
-        if inst_proc is not None:
-            res["prefill_tps"] = round(inst_proc, 1)
+        if p.get("llamacpp:predicted_tokens_seconds") is not None:
+            res["decode_tps"] = round(p["llamacpp:predicted_tokens_seconds"], 1)
+        if p.get("llamacpp:prompt_tokens_seconds") is not None:
+            res["prefill_tps"] = round(p["llamacpp:prompt_tokens_seconds"], 1)
+    elif any(k.startswith("sglang:") for k in p):
+        res["engine"] = "SGLang"
+        prompt_tok = p.get("sglang:prompt_tokens_total")
+        gen_tok = p.get("sglang:generation_tokens_total")
+        ttft_sum = p.get("sglang:time_to_first_token_seconds_sum")
+        ttft_cnt = p.get("sglang:time_to_first_token_seconds_count")
+        res["kv_pct"] = _kv_pct(p.get("sglang:token_usage"))
+        if "sglang:num_running_reqs" in p:
+            res["running"] = int(p["sglang:num_running_reqs"])
+        if "sglang:num_queue_reqs" in p:
+            res["waiting"] = int(p["sglang:num_queue_reqs"])
     else:
         res["err"] = "unknown /metrics format"
         return res
-
     res["reachable"] = True
-
-    # bank cumulative token counters into the persistent tracker (survives the
-    # inference server restarting, which zeroes these counters)
-    bank_tokens(m, prompt_tok, gen_tok)
-
-    # rate computation from the delta vs the previous poll
     prev = _model_prev.get(m["key"])
     if prev and prompt_tok is not None and gen_tok is not None:
         dt = now - prev[0]
@@ -788,81 +678,45 @@ def poll_model(m):
                 if d_cnt > 0 and d_sum >= 0:
                     res["ttft_ms"] = round(d_sum / d_cnt * 1000.0, 1)
     _model_prev[m["key"]] = (now, prompt_tok, gen_tok, ttft_sum, ttft_cnt)
-
-    # default idle-but-up rates to 0 so the UI shows a number, not a dash
     if res["decode_tps"] is None:
         res["decode_tps"] = 0.0
     if res["prefill_tps"] is None:
         res["prefill_tps"] = 0.0
-
-    # cumulative TTFT avg as a fallback when no window data yet (vLLM only)
     if res["ttft_ms"] is None and ttft_sum is not None and ttft_cnt and ttft_cnt > 0:
         res["ttft_ms"] = round(ttft_sum / ttft_cnt * 1000.0, 1)
-
-    mid = _model_id(m["endpoint"], prefer=m.get("model"), timeout=6, auth_token=m.get("auth_token"))
-    res["model"] = mid or m["label"]
+    mid = _model_id(url, prefer=m.get("model"), timeout=6, headers=_auth_headers(m))
+    res["model"] = mid or res["label"]
     return res
-
-
-# ----------------------------------------------------------------------------
-# Background pollers (one thread per node/model, staggered starts)
-# ----------------------------------------------------------------------------
-def _node_loop(node, offset):
-    time.sleep(offset)
-    while True:
-        try:
-            r = poll_node(node)
-        except Exception as e:  # noqa
-            r = {"key": node["key"], "name": node["name"], "reachable": False,
-                 "ts": time.time(), "err": str(e)[:140], "gpus": [],
-                 "temp_warn": node["temp_warn"], "temp_hot": node["temp_hot"]}
-        with _lock:
-            STATE["nodes"][node["key"]] = r
-        time.sleep(node["poll_interval"])
 
 
 def _model_loop(m, offset):
     time.sleep(offset)
+    interval = float(m.get("poll_interval") or CFG["defaults"]["model_poll_interval"])
     while True:
         try:
             r = poll_model(m)
         except Exception as e:  # noqa
-            r = {"key": m["key"], "node": m["node"], "label": m["label"],
-                 "port": m["port"], "gpus": m.get("gpus"), "reachable": False,
-                 "ts": time.time(), "err": str(e)[:140]}
+            r = _model_base(m)
+            r.update({"reachable": False, "ts": time.time(), "err": str(e)[:140]})
         with _lock:
             STATE["models"][m["key"]] = r
-        time.sleep(m["poll_interval"])
+        time.sleep(interval)
 
 
-def _switch_loop(sw):
-    time.sleep(0.5)
-    while True:
-        try:
-            r = poll_switch(sw)
-        except Exception as e:  # noqa
-            r = {"reachable": False, "name": sw["name"], "badge": sw["badge"],
-                 "ts": time.time(), "err": str(e)[:140], "health": {}, "resource": {},
-                 "ports": [], "total_bps": 0,
-                 "temp_warn": sw["temp_warn"], "temp_hot": sw["temp_hot"]}
-        with _lock:
-            STATE["switch"] = r
-        time.sleep(sw["poll_interval"])
+# ----------------------------------------------------------------------------
+# ComfyUI render lanes. Liveness + queue from ComfyUI; memory from the driver /
+# kernel reading we already collect for that GPU (ComfyUI counts torch's cached
+# blocks as free, which under-reports use).
+# ----------------------------------------------------------------------------
+_GIB = 1073741824
 
 
 def poll_comfy(lane):
-    """Scrape one ComfyUI-style image/video lane.
-
-    /system_stats gives liveness + device VRAM; /queue gives running/pending.
-    A lane that is down is a normal state, not an error. Polled server-side
-    because ComfyUI sends no CORS headers, so a browser fetch cannot read it.
-    """
-    out = {"key": lane["key"], "lane": lane.get("lane") or lane["key"],
-           "name": lane.get("name") or lane["key"], "host": lane.get("host", ""),
-           "url": lane["url"], "reachable": False, "ts": time.time(),
-           "vram_total": None, "vram_free": None, "vram_used": None,
+    out = {"key": lane["key"], "lane": lane.get("lane", ""), "name": lane.get("name", ""),
+           "host": lane.get("host", ""), "url": lane["url"], "reachable": False,
+           "ts": time.time(), "vram_total": None, "vram_free": None, "vram_used": None,
            "version": None, "running": 0, "pending": 0, "busy": False}
-    ok, body = _http_get(lane["url"] + "/system_stats", timeout=5)
+    ok, body = _http_get(lane["url"].rstrip("/") + "/system_stats", timeout=5)
     if not ok:
         return out
     try:
@@ -875,9 +729,8 @@ def poll_comfy(lane):
     if devs:
         tot, free = devs[0].get("vram_total"), devs[0].get("vram_free")
         if isinstance(tot, (int, float)) and isinstance(free, (int, float)):
-            out["vram_total"], out["vram_free"] = tot, free
-            out["vram_used"] = max(0, tot - free)
-    ok2, qbody = _http_get(lane["url"] + "/queue", timeout=5)
+            out["vram_total"], out["vram_free"], out["vram_used"] = tot, free, max(0, tot - free)
+    ok2, qbody = _http_get(lane["url"].rstrip("/") + "/queue", timeout=5)
     if ok2:
         try:
             q = json.loads(qbody)
@@ -889,1061 +742,909 @@ def poll_comfy(lane):
     return out
 
 
-def _comfy_loop(lane, delay):
-    """Poll a lane forever, latching a HIGH-WATER MARK across polls.
+def _overlay_true_mem(r, lane):
+    """Call with _lock held."""
+    src = lane.get("src") or {}
+    r["comfy_used"] = r.get("vram_used")
+    r["mem_source"] = "comfyui"
+    r["unified"] = False
+    node = STATE["nodes"].get(src.get("node") or "") or {}
+    if src.get("kind") == "gpu":
+        for g in node.get("gpus") or []:
+            if g.get("index") == src.get("index") and g.get("mem_used_mb") is not None:
+                r["vram_used"] = g["mem_used_mb"] * 1048576
+                r["vram_total"] = (g.get("mem_total_mb") or 0) * 1048576
+                r["vram_free"] = max(0, r["vram_total"] - r["vram_used"])
+                r["mem_source"] = "nvidia-smi"
+                return
+    elif src.get("kind") == "unified":
+        if node.get("mem_used_gib") is not None:
+            r["vram_used"] = node["mem_used_gib"] * _GIB
+            r["vram_total"] = (node.get("mem_total_gib") or 0) * _GIB
+            r["vram_free"] = max(0, r["vram_total"] - r["vram_used"])
+            r["mem_source"] = "unified /proc/meminfo"
+            r["unified"] = True
 
-    Peak is the number that matters for capacity planning: these models load
-    their components one at a time, so idle understates and the sum of the
-    parts overstates. Only a real render shows the true ceiling, and it lands
-    between polls, so it is latched here rather than sampled for. `peak_busy`
-    latches only while a job is in flight, which keeps a noisy neighbour on the
-    same box out of the model's number.
-    """
-    ttl = float((CFG.get("server") or {}).get("comfy_poll_seconds") or 4.0)
+
+def _comfy_loop(lane, delay):
     time.sleep(delay)
     while True:
         try:
             r = poll_comfy(lane)
-        except Exception as e:  # noqa - a down lane must never kill the poller
-            r = {"key": lane["key"], "lane": lane.get("lane") or lane["key"],
-                 "name": lane.get("name") or lane["key"], "host": lane.get("host", ""),
-                 "url": lane["url"], "reachable": False, "ts": time.time(),
-                 "err": str(e)[:140], "running": 0, "pending": 0, "busy": False}
+        except Exception as e:  # noqa
+            r = {"key": lane["key"], "lane": lane.get("lane"), "name": lane.get("name"),
+                 "host": lane.get("host"), "url": lane["url"], "reachable": False,
+                 "ts": time.time(), "err": str(e)[:140], "running": 0, "pending": 0, "busy": False}
         with _lock:
+            _overlay_true_mem(r, lane)
             prev = STATE["comfy"].get(lane["key"]) or {}
-            for fld, only_busy in (("peak_used", False), ("peak_busy", True)):
-                cur = r.get("vram_used")
-                if only_busy and not r.get("busy"):
-                    cur = None
+            for fld, gate in (("peak_used", False), ("peak_busy", True)):
                 old = prev.get(fld)
+                cur = r.get("vram_used")
+                if gate and not r.get("busy"):
+                    cur = None
                 r[fld] = max(old or 0, cur) if cur is not None else old
+            r["peak_since"] = prev.get("peak_since") or time.time()
             STATE["comfy"][lane["key"]] = r
-        time.sleep(ttl)
+        time.sleep(float(CFG.get("comfy_poll_seconds") or 4.0))
+
+
+# ----------------------------------------------------------------------------
+# Token tracker. mode "bank": poll each model's /metrics counters and bank the
+# deltas across server restarts into tokens.store. mode "read": only read a store
+# another process maintains (so two dashboards never double-bank).
+# ----------------------------------------------------------------------------
+TOK = CFG["tokens"]
+TOK_STORE = _abs(TOK.get("store") or "data/token_usage.json")
+
+
+def _token_models():
+    if TOK.get("models"):
+        return [(t["key"], t.get("name", t["key"]), t["metrics_url"]) for t in TOK["models"]]
+    return [(m["key"], m.get("label", m["key"]), m["endpoint"].rstrip("/") + "/metrics")
+            for m in MODELS if m.get("track_tokens", True)]
+
+
+def _tok_scrape(url):
+    ok, body = _http_get(url, timeout=8)
+    if not ok:
+        return None
+    prompt = gen = None
+    for line in body.splitlines():
+        if line.startswith("#"):
+            continue
+        for pre, which in (("vllm:prompt_tokens_total", "p"), ("sglang:prompt_tokens_total", "p"),
+                           ("llamacpp:prompt_tokens_total", "p"),
+                           ("vllm:generation_tokens_total", "g"), ("sglang:generation_tokens_total", "g"),
+                           ("llamacpp:tokens_predicted_total", "g")):
+            if line.startswith(pre):
+                try:
+                    v = float(line.rsplit(" ", 1)[1])
+                except Exception:
+                    continue
+                if which == "p":
+                    prompt = v
+                else:
+                    gen = v
+    if prompt is None and gen is None:
+        return None
+    return (prompt or 0.0, gen or 0.0)
+
+
+def _tok_bank(rec, cur, ft, fl, fd):
+    last = rec.get(fl)
+    if last is None:
+        rec[ft] = cur
+        rec[fl] = cur
+        rec.setdefault(fd, 0.0)
+        return
+    delta = (cur - last) if cur >= last else cur
+    rec[ft] = rec.get(ft, 0.0) + delta
+    rec[fd] = rec.get(fd, 0.0) + delta
+    rec[fl] = cur
+
+
+def _tok_loop():
+    try:
+        with open(TOK_STORE) as f:
+            state = json.load(f)
+    except Exception:
+        state = {}
+    listed = {k for k, _, _ in _token_models()}
+    for k in [k for k in list(state) if not k.startswith("_") and k not in listed]:
+        rec = state.pop(k)
+        rec["retired_on"] = datetime.date.today().isoformat()
+        state.setdefault("_retired", {})[k] = rec
+    while True:
+        try:
+            today = datetime.date.today().isoformat()
+            for key, name, url in _token_models():
+                rec = state.setdefault(key, {"name": name})
+                rec["name"] = name
+                if rec.get("today_date") != today:
+                    rec["today_date"], rec["today_prompt"], rec["today_gen"] = today, 0.0, 0.0
+                scr = _tok_scrape(url)
+                rec["reachable"] = scr is not None
+                if scr is not None:
+                    _tok_bank(rec, scr[0], "total_prompt", "last_prompt", "today_prompt")
+                    _tok_bank(rec, scr[1], "total_gen", "last_gen", "today_gen")
+                    rec["total_tokens"] = rec.get("total_prompt", 0) + rec.get("total_gen", 0)
+                rec["today_tokens"] = rec.get("today_prompt", 0) + rec.get("today_gen", 0)
+            state["_updated"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+            os.makedirs(os.path.dirname(TOK_STORE), exist_ok=True)
+            tmp = TOK_STORE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp, TOK_STORE)
+        except Exception as e:  # noqa
+            sys.stderr.write("token tracker: %r\n" % e)
+        time.sleep(float(TOK.get("poll_seconds") or 120))
+
+
+def read_tokens():
+    try:
+        with open(TOK_STORE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+# ----------------------------------------------------------------------------
+# Snapshot (shape kept compatible with the v1 /api/metrics for API consumers)
+# ----------------------------------------------------------------------------
+def start_pollers():
+    for i, n in enumerate(NODES):
+        threading.Thread(target=_node_loop, args=(n, i * 1.2), daemon=True).start()
+    if SWITCH:
+        threading.Thread(target=_switch_loop, daemon=True).start()
+    for i, ln in enumerate(COMFY_LANES):
+        STATE["comfy"][ln["key"]] = {"key": ln["key"], "lane": ln.get("lane"), "name": ln.get("name"),
+                                     "host": ln.get("host"), "url": ln["url"], "reachable": False,
+                                     "ts": 0, "err": "warming up", "running": 0, "pending": 0, "busy": False}
+        threading.Thread(target=_comfy_loop, args=(ln, 0.6 + i * 0.4), daemon=True).start()
+    for i, m in enumerate(MODELS):
+        r = _model_base(m)
+        r.update({"reachable": False, "ts": 0, "err": "warming up"})
+        STATE["models"][m["key"]] = r
+        threading.Thread(target=_model_loop, args=(m, i * 0.7), daemon=True).start()
+    if TOK.get("enabled", True) and TOK.get("mode", "bank") == "bank" and _token_models():
+        threading.Thread(target=_tok_loop, daemon=True).start()
+
+
+def snapshot():
+    with _lock:
+        nodes = [dict(STATE["nodes"][n["key"]]) for n in NODES]
+        switch = dict(STATE["switch"]) if SWITCH else None
+        hist = {k: list(v) for k, v in _hist.items()}
+        models = [dict(STATE["models"][m["key"]]) for m in MODELS if m["key"] in STATE["models"]]
+    sd = CFG["defaults"]
+    unified = [x for x in nodes if x.get("profile") == "unified"]
+    discrete = [x for x in nodes if x.get("profile") != "unified"]
+    gpu_count = len([s for s in unified if s.get("reachable")]) + sum(len(b.get("gpus") or []) for b in discrete)
+    total_power, hottest, all_ok = 0.0, {"unit": None, "temp": -1}, True
+    down = []
+    for s in unified:
+        if s.get("reachable"):
+            total_power += s.get("power") or 0
+            if s.get("temp") is not None and s["temp"] > hottest["temp"]:
+                hottest = {"unit": s["name"], "temp": s["temp"]}
+        else:
+            all_ok = False
+            down.append(s["name"])
+    for b in discrete:
+        for g in b.get("gpus") or []:
+            total_power += g.get("power") or 0
+            if g.get("temp") is not None and g["temp"] > hottest["temp"]:
+                hottest = {"unit": "%s GPU%s" % (b.get("name"), g["index"]), "temp": g["temp"]}
+        if not b.get("reachable"):
+            all_ok = False
+            down.append(b.get("name"))
+    if switch is not None and not switch.get("reachable"):
+        all_ok = False
+        down.append((SWITCH or {}).get("name", "switch"))
+    legacy_box = discrete[0] if discrete else {"reachable": False, "gpus": []}
+    if discrete:
+        for g in legacy_box.get("gpus") or []:
+            for f in ("temp", "power"):
+                k = "gpu:%s:%s:%s" % (legacy_box["key"], g["index"], f)
+                if k in hist:
+                    hist["box:%s:%s" % (g["index"], f)] = hist[k]
+
+    def by_unit(u):
+        return [m for m in models if m.get("unit") == u]
+
+    return {
+        "ts": time.time(),
+        "version": VERSION,
+        "read_only": READ_ONLY,
+        "nodes": nodes,
+        "sparks": unified,             # v1 name, kept for API consumers
+        "switch": switch or {"reachable": False, "ts": 0, "err": "not configured"},
+        "box": legacy_box,             # v1 name: the first discrete host
+        "history": hist,
+        "glm_model": next((n.get("serving") for n in NODES if n.get("serving")), None),
+        "models": models,
+        "spark_models": by_unit("spark"),
+        "box_models": by_unit("box"),
+        "ds4_models": by_unit("ds4"),
+        "glm53big_models": by_unit("glm53big"),
+        "proxy": {"reachable": False, "ts": 0, "err": "not polled", "backends": {},
+                  "sessions_pinned": None, "sessions": [], "lanes": []},
+        "agg": {"gpu_count": gpu_count, "total_power": round(total_power),
+                "hottest_unit": hottest["unit"],
+                "hottest_temp": hottest["temp"] if hottest["temp"] >= 0 else None,
+                "all_ok": all_ok, "down": down},
+        "thresholds": {"temp_warn": sd["temp_warn"], "temp_hot": sd["temp_hot"],
+                       "stale_after_s": sd["stale_after_s"]},
+    }
 
 
 def comfy_snapshot():
     with _lock:
-        return {"lanes": [STATE["comfy"].get(l["key"], {})
-                          for l in (CFG.get("comfy_lanes") or [])]}
+        return [dict(STATE["comfy"].get(l["key"], {})) for l in COMFY_LANES]
 
 
-def start_pollers():
-    for i, node in enumerate(CFG["nodes"]):
-        STATE["nodes"][node["key"]] = {
-            "key": node["key"], "name": node["name"], "reachable": False,
-            "ts": 0, "err": "warming up", "gpus": [],
-            "temp_warn": node["temp_warn"], "temp_hot": node["temp_hot"]}
-        threading.Thread(target=_node_loop, args=(node, i * 0.8), daemon=True).start()
-    for i, m in enumerate(CFG["models"]):
-        STATE["models"][m["key"]] = {
-            "key": m["key"], "node": m["node"], "label": m["label"],
-            "port": m["port"], "gpus": m.get("gpus"), "reachable": False,
-            "ts": 0, "err": "warming up"}
-        threading.Thread(target=_model_loop, args=(m, i * 0.5), daemon=True).start()
-    if CFG.get("switch"):
-        sw = CFG["switch"]
-        STATE["switch"] = {"reachable": False, "name": sw["name"], "badge": sw["badge"],
-                           "ts": 0, "err": "warming up", "health": {}, "resource": {},
-                           "ports": [], "total_bps": 0,
-                           "temp_warn": sw["temp_warn"], "temp_hot": sw["temp_hot"]}
-        threading.Thread(target=_switch_loop, args=(sw,), daemon=True).start()
-    for i, ln in enumerate(CFG.get("comfy_lanes") or []):
-        STATE["comfy"][ln["key"]] = {
-            "key": ln["key"], "lane": ln.get("lane") or ln["key"],
-            "name": ln.get("name") or ln["key"], "host": ln.get("host", ""),
-            "url": ln["url"], "reachable": False, "ts": 0,
-            "err": "warming up", "running": 0, "pending": 0, "busy": False}
-        threading.Thread(target=_comfy_loop, args=(ln, 0.6 + i * 0.4),
-                         daemon=True).start()
+_stations_cache = {"ts": 0, "data": []}
+
+
+def stations_snapshot():
+    st = CFG["stations"]
+    if not st.get("enabled"):
+        return []
+    if time.time() - _stations_cache["ts"] < 10:
+        return _stations_cache["data"]
+    out = []
+    for s in st.get("items") or []:
+        code = _http_status(s.get("probe_url") or s["url"], timeout=3)
+        out.append({"emoji": s.get("emoji", ""), "name": s["name"], "desc": s.get("desc", ""),
+                    "port": s.get("port"), "url": s["url"], "up": code != 0})
+    _stations_cache.update(ts=time.time(), data=out)
+    return out
 
 
 # ----------------------------------------------------------------------------
-# Aggregate / snapshot
+# Chat: an SSE proxy to any OpenAI-compatible /v1/chat/completions endpoint.
 # ----------------------------------------------------------------------------
-def snapshot():
-    with _lock:
-        nodes = [dict(STATE["nodes"][n["key"]]) for n in CFG["nodes"]]
-        models_by_node = {}
-        fleet_models = []
-        for m in CFG["models"]:
-            st = STATE["models"].get(m["key"])
-            if not st:
-                continue
-            item = dict(st)
-            item["group"] = m.get("group")
-            if m["node"]:
-                models_by_node.setdefault(m["node"], []).append(item)
-            else:
-                fleet_models.append(item)
-        switch = dict(STATE["switch"]) if STATE.get("switch") else None
-        hist = {k: list(v) for k, v in _hist.items()}
+CHAT = CFG["chat"]
 
-    # attach each node's model perf cards
-    for n in nodes:
-        n["models"] = models_by_node.get(n["key"], [])
 
-    # fleet aggregates
-    gpu_count = 0
-    total_power = 0.0
-    hottest = {"unit": None, "temp": -1}
-    severity = {"ok": 0, "warning": 1, "degraded": 2, "hot": 3}
-    fleet_status = "ok"
-    issues = []
+def chat_endpoints():
+    eps = []
+    if CHAT.get("base_url") and CHAT.get("model"):
+        eps.append({"base_url": CHAT["base_url"], "model": CHAT["model"],
+                    "api_key": CHAT.get("api_key") or ""})
+    for fb in CHAT.get("fallbacks") or []:
+        if fb.get("base_url") and fb.get("model"):
+            eps.append({"base_url": fb["base_url"], "model": fb["model"],
+                        "api_key": fb.get("api_key") or ""})
+    return eps
 
-    def promote(level, issue):
-        nonlocal fleet_status
-        if severity[level] > severity[fleet_status]:
-            fleet_status = level
-        issues.append(issue)
 
-    for n in nodes:
+def _ep_headers(ep, stream=False):
+    h = {"Content-Type": "application/json", "User-Agent": "command-center-v2"}
+    if stream:
+        h["Accept"] = "text/event-stream"
+    if ep.get("api_key"):
+        h["Authorization"] = "Bearer " + ep["api_key"]
+    return h
+
+
+_chat_probe = {"ts": 0, "data": None}
+
+
+def chat_status(force=False):
+    if not CHAT.get("enabled", True):
+        return {"enabled": False, "configured": False, "reachable": False, "name": CHAT.get("name")}
+    eps = chat_endpoints()
+    if not eps:
+        return {"enabled": True, "configured": False, "reachable": False, "name": CHAT.get("name")}
+    if not force and _chat_probe["data"] and time.time() - _chat_probe["ts"] < 20:
+        return _chat_probe["data"]
+    out = {"enabled": True, "configured": True, "reachable": False, "name": CHAT.get("name"),
+           "model": eps[0]["model"], "active_model": None, "fallback": False,
+           "endpoints": len(eps)}
+    for i, ep in enumerate(eps):
+        try:
+            req = urllib.request.Request(ep["base_url"].rstrip("/") + "/models", headers=_ep_headers(ep))
+            with urllib.request.urlopen(req, timeout=5) as r:
+                r.read(65536)
+            out.update(reachable=True, active_model=ep["model"], fallback=i > 0)
+            break
+        except urllib.error.HTTPError as e:
+            # Some agent APIs have no /models route; any HTTP answer means it is listening.
+            if e.code in (404, 405):
+                out.update(reachable=True, active_model=ep["model"], fallback=i > 0)
+                break
+        except Exception:
+            continue
+    _chat_probe.update(ts=time.time(), data=out)
+    return out
+
+
+def _tz():
+    name = CFG["server"].get("timezone") or ""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name) if name else None
+    except Exception:
+        return None
+
+
+def _now_local():
+    tz = _tz()
+    return datetime.datetime.now(tz) if tz else datetime.datetime.now().astimezone()
+
+
+def _age(ts):
+    return int(time.time() - ts) if ts else None
+
+
+def fleet_context():
+    """A compact plain-text read of the live dashboard for the chat's system prompt."""
+    s = snapshot()
+    lines = []
+    agg = s["agg"]
+    lines.append("FLEET: %s. %s GPUs online, %s W total draw, hottest %s at %s C."
+                 % ("ALL OK" if agg["all_ok"] else "DEGRADED (down: %s)" % ", ".join(agg["down"]),
+                    agg["gpu_count"], agg["total_power"], agg["hottest_unit"] or "n/a",
+                    "%.0f" % agg["hottest_temp"] if agg["hottest_temp"] is not None else "n/a"))
+    for n in s["nodes"]:
         if not n.get("reachable"):
-            promote("degraded", f"{n['name']} unreachable")
+            lines.append("- NODE %s: UNREACHABLE (%s), last good poll %ss ago."
+                         % (n["name"], n.get("err") or "no response", _age(n.get("ts"))))
+            continue
+        if n.get("profile") == "unified":
+            lines.append("- NODE %s (unified-memory GPU%s): %s C, %s W, util %s%%, SM %s MHz, memory %s/%s GiB (%s%%), model resident %s GiB, serving %s%s."
+                         % (n["name"], ", " + n["node_id"] if n.get("node_id") else "",
+                            n.get("temp"), n.get("power"), n.get("util"), n.get("sm_clock"),
+                            n.get("mem_used_gib"), n.get("mem_total_gib"), n.get("mem_pct"),
+                            n.get("model_gib"), n.get("model") or "nothing",
+                            " (%s)" % n["pair"] if n.get("pair") else ""))
+        else:
+            gp = "; ".join("GPU%s %s %s C %s/%s W util %s%% VRAM %.1f/%.1f GiB"
+                           % (g["index"], g.get("name"), g.get("temp"), g.get("power"),
+                              g.get("power_limit"), g.get("util"),
+                              (g.get("mem_used_mb") or 0) / 1024, (g.get("mem_total_mb") or 0) / 1024)
+                           for g in n.get("gpus") or [])
+            cont = ", ".join(m.get("label") for m in n.get("models") or [])
+            lines.append("- NODE %s (%s GPUs): CPU %s C, RAM %s%%. %s.%s"
+                         % (n["name"], len(n.get("gpus") or []), n.get("cpu_temp"), n.get("mem_pct"),
+                            gp, " Containers: %s." % cont if cont else ""))
+    if SWITCH:
+        sw = s["switch"]
+        if sw.get("reachable"):
+            h = sw.get("health") or {}
+            lines.append("- SWITCH %s: up, switch %s C, cpu %s C, fans %s, PSU1 %s PSU2 %s, uptime %s, fabric %s. Ports: %s."
+                         % (SWITCH.get("name", "switch"), h.get("switch-temperature"), h.get("cpu-temperature"),
+                            h.get("fan-state"), h.get("psu1-state"), h.get("psu2-state"),
+                            (sw.get("resource") or {}).get("uptime"), _fmt_bps(sw.get("total_bps")),
+                            ", ".join("%s %s" % (p["name"], "link-ok" if p.get("running") else "DOWN")
+                                      for p in sw.get("ports") or [])))
+        else:
+            lines.append("- SWITCH %s: UNREACHABLE (%s)." % (SWITCH.get("name", "switch"), sw.get("err")))
+    for m in s["models"]:
+        if m.get("reachable"):
+            lines.append("- MODEL %s [%s, %s, port %s]: UP, decode %s tok/s, prefill %s tok/s, TTFT %s ms, KV %s%%, %s running, %s waiting."
+                         % (m["label"], m.get("model"), m.get("engine"), m.get("port"), m.get("decode_tps"),
+                            m.get("prefill_tps"), m.get("ttft_ms"), m.get("kv_pct"), m.get("running"),
+                            m.get("waiting")))
+        else:
+            lines.append("- MODEL %s [port %s]: DOWN (%s)." % (m["label"], m.get("port"), m.get("err")))
+    for l in comfy_snapshot():
+        if not l:
+            continue
+        lines.append("- RENDER LANE %s %s (ComfyUI): %s, queue %s, node memory %s/%s GB."
+                     % (l.get("lane"), l.get("name"),
+                        "DOWN (ComfyUI is not answering on its port)" if not l.get("reachable")
+                        else ("up, RENDERING" if l.get("busy") else "up, idle"),
+                        (l.get("running") or 0) + (l.get("pending") or 0),
+                        "%.1f" % (l["vram_used"] / _GIB) if l.get("vram_used") is not None else "?",
+                        "%.1f" % (l["vram_total"] / _GIB) if l.get("vram_total") else "?"))
+    if TOK.get("enabled", True):
+        t = read_tokens()
+        for k, v in t.items():
+            if k.startswith("_") or not isinstance(v, dict):
+                continue
+            lines.append("- TOKENS %s: %s total (%s prompt, %s generated), %s today, %s."
+                         % (v.get("name", k), _fmt_tok(v.get("total_tokens")), _fmt_tok(v.get("total_prompt")),
+                            _fmt_tok(v.get("total_gen")), _fmt_tok(v.get("today_tokens")),
+                            "live" if v.get("reachable") else "offline"))
+    stations = stations_snapshot()
+    for st in stations:
+        lines.append("- STATION %s: %s." % (st["name"], "up" if st["up"] else "DOWN"))
+    # Precomputed totals + one down-list at the top, so the model never has to count.
+    lanes = [l for l in comfy_snapshot() if l]
+    down = ["node %s" % n["name"] for n in s["nodes"] if not n.get("reachable")]
+    if SWITCH and not s["switch"].get("reachable"):
+        down.append("switch %s" % SWITCH.get("name", "switch"))
+    down += ["model %s" % m["label"] for m in s["models"] if not m.get("reachable")]
+    down += ["render lane %s (%s)" % (l.get("lane"), l.get("name")) for l in lanes if not l.get("reachable")]
+    down += ["station %s" % st["name"] for st in stations if not st["up"]]
+    counts = ["%d nodes (%d answering)" % (len(s["nodes"]), sum(1 for n in s["nodes"] if n.get("reachable")))]
+    if SWITCH:
+        counts.append("1 switch (%s)" % ("up" if s["switch"].get("reachable") else "down"))
+    counts.append("%d model servers (%d up)" % (len(s["models"]), sum(1 for m in s["models"] if m.get("reachable"))))
+    if lanes:
+        counts.append("%d render lanes (%d up, %d rendering)" % (len(lanes), sum(1 for l in lanes if l.get("reachable")), sum(1 for l in lanes if l.get("busy"))))
+    if stations:
+        counts.append("%d web stations (%d up)" % (len(stations), sum(1 for st in stations if st["up"])))
+    head = ["TOTALS (use these numbers, do not count yourself): " + ", ".join(counts) + ".",
+            "DOWN RIGHT NOW (%d): %s." % (len(down), "; ".join(down) if down else "nothing")]
+    return "\n".join(head + lines)
 
-        for m in n.get("models", []):
-            if not m.get("reachable"):
-                promote("degraded", f"{m['label']} unavailable")
 
-        for g in n.get("gpus", []):
-            gpu_count += 1
-            if g.get("power"):
-                total_power += g["power"]
-            temp = g.get("temp")
-            if temp is not None:
-                unit = f"{n['name']} GPU{g['index']}"
-                if temp > hottest["temp"]:
-                    hottest = {"unit": unit, "temp": temp}
-                if temp >= n["temp_hot"]:
-                    promote("hot", f"{unit} hot ({temp:.0f} C)")
-                elif temp >= n["temp_warn"]:
-                    promote("warning", f"{unit} warm ({temp:.0f} C)")
+def _fmt_bps(b):
+    b = float(b or 0)
+    for unit, div in (("Gbps", 1e9), ("Mbps", 1e6), ("Kbps", 1e3)):
+        if b >= div:
+            return "%.2f %s" % (b / div, unit)
+    return "%.0f bps" % b
 
-        host_temp = n.get("cpu_temp")
-        if host_temp is not None:
-            if host_temp >= n["temp_hot"] + 6:
-                promote("hot", f"{n['name']} host hot ({host_temp:.0f} C)")
-            elif host_temp >= n["temp_warn"] + 5:
-                promote("warning", f"{n['name']} host warm ({host_temp:.0f} C)")
 
-    for m in fleet_models:
-        if not m.get("reachable"):
-            promote("degraded", f"{m['label']} unavailable")
+def _fmt_tok(n):
+    n = float(n or 0)
+    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if n >= div:
+            return "%.2f%s" % (n / div, unit)
+    return "%d" % n
 
-    if switch and not switch.get("reachable"):
-        promote("degraded", f"{switch.get('name', 'switch')} unreachable")
 
-    return {
-        "ts": time.time(),
-        "title": CFG["server"]["title"],
-        "subtitle": CFG["server"]["subtitle"],
-        "browser_refresh_ms": CFG["server"]["browser_refresh_ms"],
-        "switch": switch,
-        "nodes": nodes,
-        "fleet_models": fleet_models,
-        "tokens": tokens_snapshot(),
-        "history": hist,
-        "agg": {
-            "gpu_count": gpu_count,
-            "total_power": round(total_power),
-            "hottest_unit": hottest["unit"],
-            "hottest_temp": hottest["temp"] if hottest["temp"] >= 0 else None,
-            "status": fleet_status,
-            "issues": issues[:8],
-            "all_ok": fleet_status == "ok",
-        },
-    }
+def build_system_prompt():
+    name = CHAT.get("name") or "Jarvis"
+    title = CFG["server"].get("title") or "Command Center"
+    now = _now_local()
+    persona = CHAT.get("system_prompt") or (
+        "You are %s, the assistant built into the %s, a read-only dashboard for a self-hosted AI fleet. "
+        "Answer questions about the fleet from the live dashboard data below." % (name, title))
+    rules = (
+        "Rules: be direct and short, plain English. Never invent a number, model name or status: if the "
+        "data below does not have it, say the dashboard does not report it. Anything marked DOWN or UNREACHABLE counts as down; do "
+        "not explain it away or guess why. When something is down, say which one and the error text "
+        "you were given. The dashboard is read-only: you cannot restart, "
+        "stop or change anything, so say so if asked and suggest what a human could check. Do not use em "
+        "dashes. Do not use markdown headings; short lists are fine.")
+    ctx = ""
+    if CHAT.get("grounding", True):
+        try:
+            ctx = "\n\nLIVE DASHBOARD DATA (read %s):\n%s" % (now.strftime("%I:%M:%S %p %Z"), fleet_context())
+        except Exception as e:  # noqa
+            ctx = "\n\n(The live data could not be read: %s)" % e
+    return "%s\n\n%s\n\nIt is currently %s.%s" % (persona, rules, now.strftime("%A, %B %d, %Y %I:%M %p %Z"), ctx)
+
+
+class ThinkStripper:
+    """Removes <think>...</think> reasoning from a streamed reply. If a closing tag shows up
+    without an opening one (templates that open the block inside the prompt), everything before
+    it was reasoning: the caller gets reset=True and the text after the tag."""
+    OPEN, CLOSE = "<think>", "</think>"
+
+    def __init__(self):
+        self.buf = ""
+        self.inside = False
+        self.started = False
+
+    def feed(self, text):
+        self.buf += text
+        out, reset = "", False
+        while self.buf:
+            if self.inside:
+                i = self.buf.find(self.CLOSE)
+                if i < 0:
+                    keep = len(self.CLOSE) - 1
+                    self.buf = self.buf[-keep:] if len(self.buf) > keep else self.buf
+                    return out, reset, True
+                self.buf = self.buf[i + len(self.CLOSE):].lstrip()
+                self.inside = False
+                continue
+            io, ic = self.buf.find(self.OPEN), self.buf.find(self.CLOSE)
+            if ic >= 0 and (io < 0 or ic < io):
+                reset = True
+                out = ""
+                self.buf = self.buf[ic + len(self.CLOSE):].lstrip()
+                continue
+            if io >= 0:
+                out += self.buf[:io]
+                self.buf = self.buf[io + len(self.OPEN):]
+                self.inside = True
+                continue
+            # hold back a tail that could be the start of a tag
+            hold = 0
+            for tag in (self.OPEN, self.CLOSE):
+                for k in range(len(tag) - 1, 0, -1):
+                    if self.buf.endswith(tag[:k]):
+                        hold = max(hold, k)
+                        break
+            out += self.buf[: len(self.buf) - hold]
+            self.buf = self.buf[len(self.buf) - hold:]
+            break
+        return out, reset, False
+
+    def flush(self):
+        out = "" if self.inside else self.buf
+        self.buf = ""
+        return out
+
+
+def open_chat_stream(messages):
+    """Try each configured endpoint in order. A connection failure moves on to the next; an HTTP
+    error is returned as-is (the model answered and said no)."""
+    sysmsg = build_system_prompt()
+    body_msgs = [{"role": "system", "content": sysmsg}]
+    turns = [m for m in (messages or []) if m.get("role") in ("user", "assistant") and m.get("content")]
+    for m in turns[-int(CHAT.get("history_turns") or 12):]:
+        body_msgs.append({"role": m["role"], "content": str(m["content"])[:8000]})
+    last_err = None
+    for i, ep in enumerate(chat_endpoints()):
+        payload = {"model": ep["model"], "messages": body_msgs, "stream": True,
+                   "temperature": float(CHAT.get("temperature", 0.1)),
+                   "max_tokens": int(CHAT.get("max_tokens") or 1200)}
+        payload.update(CHAT.get("extra_body") or {})
+        req = urllib.request.Request(ep["base_url"].rstrip("/") + "/chat/completions",
+                                     data=json.dumps(payload).encode("utf-8"),
+                                     headers=_ep_headers(ep, stream=True), method="POST")
+        try:
+            resp = urllib.request.urlopen(req, timeout=float(CHAT.get("timeout") or 180))
+            return resp, ep, i > 0, None
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                detail = ""
+            return None, ep, i > 0, "HTTP %s from %s: %s" % (e.code, ep["model"], detail)
+        except Exception as e:  # noqa
+            last_err = "%s: %s" % (type(e).__name__, e)
+            continue
+    return None, None, False, last_err or "no chat endpoint configured"
 
 
 # ----------------------------------------------------------------------------
 # HTTP
 # ----------------------------------------------------------------------------
+STATIC = _abs(CFG["server"].get("static_dir") or "web/dist")
+
+
+def public_config():
+    """What the browser needs to lay the page out. No hosts, keys or endpoints."""
+    sv = CFG["server"]
+    sections = CFG.get("sections") or []
+    if not sections:
+        uni = [n["key"] for n in NODES if n.get("profile") == "unified"]
+        dis = [n["key"] for n in NODES if n.get("profile") != "unified"]
+        if uni:
+            sections.append({"key": "unified", "title": "GPU cluster", "nodes": uni, "switch": True, "units": ["spark"]})
+        for k in dis:
+            sections.append({"key": k, "title": NODE_BY_KEY[k].get("name", k), "nodes": [k], "units": [k]})
+        units = {m.get("unit", "fleet") for m in MODELS}
+        used = {u for s in sections for u in s.get("units", [])}
+        for u in sorted(units - used):
+            sections.append({"key": "models-" + u, "title": "Models", "nodes": [], "units": [u]})
+    return {
+        "version": VERSION,
+        "title": sv.get("title"), "subtitle": sv.get("subtitle"), "location": sv.get("location"),
+        "timezone": sv.get("timezone") or None,
+        "refresh_ms": int(sv.get("browser_refresh_ms") or 2500),
+        "read_only": READ_ONLY,
+        "sections": sections,
+        "nodes": [{"key": n["key"], "name": n.get("name", n["key"]), "profile": n.get("profile", "discrete"),
+                   "badge": n.get("badge"), "temp_warn": n.get("temp_warn"), "temp_hot": n.get("temp_hot")}
+                  for n in NODES],
+        "switch": {"name": SWITCH.get("name", "Fabric switch"), "badge": SWITCH.get("badge", "FABRIC"),
+                   "temp_warn": SWITCH.get("temp_warn", 55), "temp_hot": SWITCH.get("temp_hot", 70)} if SWITCH else None,
+        "models": [{"key": m["key"], "unit": m.get("unit", "fleet"), "node": m.get("node")} for m in MODELS],
+        "comfy": {"enabled": bool(COMFY_LANES), "title": CFG.get("comfy_title") or "Render lanes"},
+        "tokens": {"enabled": bool(TOK.get("enabled", True)), "order": TOK.get("order") or []},
+        "eco": {"enabled": bool(CFG["eco"].get("enabled")),
+                "writes": bool(CFG["eco"].get("allow_writes")) and not READ_ONLY,
+                "levels": CFG["eco"].get("levels") or [],
+                "nodes": [{"key": n["key"], "name": n.get("name", n["key"])} for n in NODES if n.get("profile") == "unified"],
+                "info_url": CFG["eco"].get("info_url") or ""},
+        "stations": {"enabled": bool(CFG["stations"].get("enabled"))},
+        "keylights": {"enabled": bool(CFG["keylights"].get("enabled")),
+                      "writes": bool(CFG["keylights"].get("allow_writes")) and not READ_ONLY},
+        "chat": {"enabled": bool(CHAT.get("enabled", True)), "name": CHAT.get("name") or "Jarvis",
+                 "suggestions": CHAT.get("suggestions") or []},
+    }
+
+
+def _allowed_hosts():
+    hs = {"localhost", "127.0.0.1", "[::1]"}
+    for b in CFG["server"]["bind"]:
+        if b not in ("0.0.0.0", "::"):
+            hs.add(b.lower())
+    for h in CFG["server"].get("allowed_hosts") or []:
+        hs.add(h.lower())
+    return hs
+
+
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a):  # silence default logging
+    server_version = "CommandCenter/" + VERSION
+
+    def log_message(self, *a):
         pass
 
-    def _send(self, code, body, ctype="text/html; charset=utf-8"):
+    def _send(self, code, body, ctype="application/json; charset=utf-8", cache="no-store"):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", cache)
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         try:
             self.wfile.write(body)
         except Exception:
             pass
 
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj))
+
+    def _same_origin(self, need_json=True):
+        host = (self.headers.get("Host") or "").strip().lower()
+        hostname = host.split("]")[0] + "]" if host.startswith("[") else host.rsplit(":", 1)[0]
+        if "0.0.0.0" not in CFG["server"]["bind"] and hostname not in _allowed_hosts():
+            return False, "host %r is not allowed" % host
+        if (self.headers.get("Sec-Fetch-Site") or "").lower() == "cross-site":
+            return False, "cross-site request"
+        origin = self.headers.get("Origin")
+        if origin is not None and urllib.parse.urlparse(origin.strip()).netloc.lower() != host:
+            return False, "origin does not match host"
+        if need_json and "application/json" not in (self.headers.get("Content-Type") or "").lower():
+            return False, "content type must be application/json"
+        return True, None
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if n > 256 * 1024:
+            return None
+        raw = self.rfile.read(n) if n else b""
+        try:
+            return json.loads(raw or b"{}")
+        except Exception:
+            return None
+
+    # -------------------------------------------------------------- GET
     def do_GET(self):
-        if self.path.startswith("/api/metrics"):
-            self._send(200, json.dumps(snapshot()), "application/json")
-            return
-        if self.path.startswith("/api/tokens"):
-            self._send(200, json.dumps(tokens_snapshot()), "application/json")
-            return
-        if self.path.startswith("/api/comfy"):
-            self._send(200, json.dumps(comfy_snapshot()), "application/json")
-            return
-        if self.path == "/healthz":
-            self._send(200, "ok", "text/plain")
-            return
-        if self.path.startswith("/api/eco-status"):
-            self._send(200, json.dumps({"status": eco_status(),
-                                        "writes_enabled": os.path.exists(ECO_KEY_FILE)}),
-                       "application/json")
-            return
-        if self.path.startswith("/api/eco-set"):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/healthz":
+            return self._send(200, "ok", "text/plain")
+        if path == "/api/metrics":
+            return self._json(snapshot())
+        if path == "/api/config":
+            return self._json(public_config())
+        if path == "/api/comfy":
+            return self._json({"lanes": comfy_snapshot()})
+        if path == "/api/tokens":
+            return self._json(read_tokens() if TOK.get("enabled", True) else {})
+        if path == "/api/stations":
+            return self._json({"stations": stations_snapshot()})
+        if path == "/api/lights":
+            kl = CFG["keylights"]
+            if not kl.get("enabled") or not kl.get("url"):
+                return self._json({"lights": [], "down": True, "disabled": True})
+            ok, text = _http_get(kl["url"].rstrip("/") + "/api/lights", timeout=10)
+            if not ok:
+                return self._json({"lights": [], "down": True})
+            return self._send(200, text or '{"lights":[]}')
+        if path == "/api/eco-status":
+            return self._eco_status()
+        if path == "/api/eco-set":
+            return self._json({"ok": False, "error": "use POST /api/eco-set"}, 405)
+        if path == "/api/chat/status":
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            if not _eco_key_ok(q.get("key", [""])[0]):
-                self._send(403, json.dumps({"ok": False, "error": "bad or missing key (create eco_key.txt to enable writes)"}), "application/json")
-                return
-            level = q.get("level", [""])[0]
-            node = q.get("node", ["fleet"])[0]
-            if level != "off" and level not in ECO_LEVELS:
-                self._send(400, json.dumps({"ok": False, "error": "bad level"}), "application/json")
-                return
-            out, found = eco_set(node, level)
-            if not found:
-                self._send(400, json.dumps({"ok": False, "error": "bad node"}), "application/json")
-                return
-            self._send(200, json.dumps({"ok": True, "applied": level, "nodes": out}), "application/json")
+            return self._json(chat_status(force=q.get("force", ["0"])[0] == "1"))
+        if path.startswith("/api/"):
+            return self._json({"ok": False, "error": "not found"}, 404)
+        return self._static(path)
+
+    def _static(self, path):
+        if not os.path.isdir(STATIC):
+            return self._send(503, "<h1>Web UI not built</h1><p>Run <code>cd web && npm install && npm run build</code>.</p>",
+                              "text/html; charset=utf-8")
+        rel = os.path.normpath(urllib.parse.unquote(path)).lstrip("/")
+        full = os.path.join(STATIC, rel)
+        if not full.startswith(STATIC) or not rel or not os.path.isfile(full):
+            full = os.path.join(STATIC, "index.html")
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        if ctype.startswith("text/") or ctype in ("application/javascript", "image/svg+xml"):
+            ctype += "; charset=utf-8"
+        cache = "public, max-age=31536000, immutable" if "/assets/" in full else "no-store"
+        with open(full, "rb") as f:
+            self._send(200, f.read(), ctype, cache)
+
+    def _eco_status(self):
+        eco = CFG["eco"]
+        if not eco.get("enabled"):
+            return self._json({"status": {}, "disabled": True})
+        out = {}
+
+        def one(n):
+            try:
+                rc, o, e = _run(remote_argv(n, "nvidia-smi --query-gpu=clocks.gr,temperature.gpu,power.draw --format=csv,noheader"), timeout=20)
+                v = (o or e or "").strip()
+                out[n["key"]] = v.split("\n")[0][:60] if v else "no reply"
+            except Exception as ex:  # noqa
+                out[n["key"]] = "err: %s" % str(ex)[:40]
+        ths = [threading.Thread(target=one, args=(n,)) for n in NODES if n.get("profile") == "unified"]
+        [t.start() for t in ths]
+        [t.join(28) for t in ths]
+        return self._json({"status": out})
+
+    # -------------------------------------------------------------- POST
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        ok, why = self._same_origin()
+        if not ok:
+            return self._json({"ok": False, "error": "same-origin only (%s)" % why}, 403)
+        if path == "/api/chat":
+            return self._chat()
+        if path in ("/api/eco-set", "/api/lights-set", "/api/ds4-move"):
+            return self._write_route(path)
+        return self._json({"ok": False, "error": "not found"}, 404)
+
+    def _write_route(self, path):
+        """Every route that changes something on another machine. Refused in read-only mode."""
+        body = self._body() or {}
+        if READ_ONLY:
+            return self._json({"ok": False, "read_only": True,
+                               "error": "This dashboard is running read-only. Set server.read_only=false in config.json to enable actions."}, 403)
+        if path == "/api/lights-set":
+            kl = CFG["keylights"]
+            if not (kl.get("enabled") and kl.get("allow_writes")):
+                return self._json({"ok": False, "error": "key light control is disabled"}, 403)
+            code, text = _http_post(kl["url"].rstrip("/") + "/api/set", json.dumps(body).encode(), timeout=10)
+            if code == 0:
+                return self._json({"ok": False, "error": "key light panel unreachable"}, 502)
+            return self._send(code, text or "{}")
+        if path == "/api/eco-set":
+            eco = CFG["eco"]
+            if not (eco.get("enabled") and eco.get("allow_writes")):
+                return self._json({"ok": False, "error": "clock caps are disabled"}, 403)
+            levels = {str(l["value"]): l.get("arg") for l in eco.get("levels") or [] if l.get("value") != "off"}
+            level, node = str(body.get("level", "")), body.get("node", "fleet")
+            if level != "off" and level not in levels:
+                return self._json({"ok": False, "error": "bad level"}, 400)
+            targets = [n for n in NODES if n.get("profile") == "unified" and (node == "fleet" or n["key"] == node)]
+            if not targets:
+                return self._json({"ok": False, "error": "bad node"}, 400)
+            cmd = "sudo nvidia-smi -rgc" if level == "off" else "sudo nvidia-smi -lgc " + levels[level]
+            out = {}
+
+            def one(n):
+                rc, o, e = _run(remote_argv(n, cmd), timeout=30)
+                out[n["key"]] = ((o or e or "ok").strip())[:120]
+            ths = [threading.Thread(target=one, args=(n,)) for n in targets]
+            [t.start() for t in ths]
+            [t.join(35) for t in ths]
+            return self._json({"ok": True, "applied": level, "nodes": out})
+        return self._json({"ok": False, "error": "this action is not available in v2"}, 410)
+
+    # -------------------------------------------------------------- chat SSE
+    def _sse_start(self, extra=None):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.close_connection = True
+
+    def _sse(self, obj):
+        self.wfile.write(b"data: " + json.dumps(obj).encode("utf-8") + b"\n\n")
+        self.wfile.flush()
+
+    def _chat(self):
+        body = self._body()
+        if body is None:
+            return self._json({"ok": False, "error": "bad JSON"}, 400)
+        if not CHAT.get("enabled", True):
+            return self._json({"ok": False, "error": "chat is disabled"}, 403)
+        if not chat_endpoints():
+            return self._json({"ok": False, "configured": False,
+                               "error": "No model is configured. Set chat.base_url and chat.model in config.json (or CC_CHAT_BASE_URL / CC_CHAT_MODEL)."}, 503)
+        resp, ep, fallback, err = open_chat_stream(body.get("messages") or [])
+        self._sse_start()
+        if resp is None:
+            self._sse({"error": err, "delta": "I could not reach the model (%s)." % err})
+            self.wfile.write(b"data: [DONE]\n\n")
             return
-        self._send(200, PAGE)
+        strip = ThinkStripper()
+        got, thinking = False, False
+        try:
+            self._sse({"meta": {"model": ep["model"], "fallback": fallback}})
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(chunk)
+                except Exception:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                d = choices[0].get("delta") or {}
+                if (d.get("reasoning_content") or d.get("reasoning")) and not got and not thinking:
+                    thinking = True
+                    self._sse({"status": "thinking"})
+                text = d.get("content")
+                if not text:
+                    continue
+                out, reset, inside = strip.feed(text)
+                if reset:
+                    got = False
+                    self._sse({"reset": True})
+                if inside and not thinking and not got:
+                    thinking = True
+                    self._sse({"status": "thinking"})
+                if out:
+                    if not got:
+                        out = out.lstrip()
+                        if not out:
+                            continue
+                    got = True
+                    self._sse({"delta": out})
+            tail = strip.flush()
+            if tail:
+                got = True
+                self._sse({"delta": tail})
+            if not got:
+                self._sse({"delta": "(The model finished without a text reply.)"})
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception as e:  # noqa
+            try:
+                self._sse({"delta": "\n[stream error: %s]" % e})
+            except Exception:
+                pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
 
-PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Sparky Command Center</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  :root{
-    /* Burnt-orange on scorched brown. The neutrals carry a red/brown bias on
-       purpose so nothing reads as generic grey next to the orange. Semantic
-       green/yellow/red stay clearly separate in hue from the accent so a
-       warning pill never gets mistaken for an accent. */
-    --bg:#0c0805; --bg2:#150e08; --card:rgba(40,27,17,0.62); --border:rgba(224,132,42,0.20);
-    --txt:#f7f1ea; --dim:#a6907c; --accent:#ff7a1a; --accent2:#ffb454;
-    --green:#5ec46a; --yellow:#f0c419; --red:#ff5347;
-    --display:'Futura','Avenir Next Condensed','Oswald','Segoe UI',sans-serif;
-    --mono:'SF Mono','Menlo','JetBrains Mono',ui-monospace,monospace;
-    /* Themeable extras. --accent-rgb exists so every rgba() tint follows the
-       accent instead of hard-coding orange; --on-accent is the text colour that
-       sits ON a filled accent button, which has to flip on light themes. */
-    --accent-rgb:255,122,26; --on-accent:#1a0d04;
-    --glow1:rgba(255,122,26,0.13); --glow2:rgba(140,60,20,0.16);
-    --grad-a:#0a0603; --grad-b:#140d07;
-  }
-
-  /* ── Themes ──────────────────────────────────────────────────────────────
-     Sunset is :root above (the default). Each theme below only redefines
-     tokens, never component rules, so a new theme cannot break layout. */
-
-  /* BREEZE — the cool blue original, rebuilt from scratch: the pre-Sunset CSS
-     is not in any commit, so this is a reconstruction, not a restoration. */
-  :root[data-theme="breeze"]{
-    --bg:#06090f; --bg2:#0b1220; --card:rgba(18,30,48,0.62); --border:rgba(90,170,255,0.20);
-    --txt:#eaf2fb; --dim:#8296ad; --accent:#38bdf8; --accent2:#7dd3fc;
-    --green:#4ade80; --yellow:#fbbf24; --red:#f87171;
-    --accent-rgb:56,189,248; --on-accent:#04121d;
-    --glow1:rgba(56,189,248,0.13); --glow2:rgba(30,80,160,0.18);
-    --grad-a:#04070d; --grad-b:#0a111e;
-  }
-  /* LIGHT — inverted. Neutrals carry a slight cool bias so white cards on a
-     white page still separate, and the accent darkens to stay legible. */
-  :root[data-theme="light"]{
-    --bg:#f4f6f9; --bg2:#ffffff; --card:rgba(255,255,255,0.86); --border:rgba(15,35,60,0.14);
-    --txt:#14202e; --dim:#5b6b7d; --accent:#0b6fd4; --accent2:#2f92f0;
-    --green:#17914a; --yellow:#a86a00; --red:#cc2b2b;
-    --accent-rgb:11,111,212; --on-accent:#ffffff;
-    --glow1:rgba(11,111,212,0.07); --glow2:rgba(120,150,190,0.10);
-    --grad-a:#eef2f7; --grad-b:#ffffff;
-  }
-  /* DARK — true neutral black. The accent goes silver so the UI reads as
-     monochrome; semantic green/yellow/red stay saturated to carry all state. */
-  :root[data-theme="dark"]{
-    --bg:#050505; --bg2:#0e0e0e; --card:rgba(26,26,26,0.66); --border:rgba(255,255,255,0.13);
-    --txt:#f2f2f2; --dim:#8c8c8c; --accent:#e6e6e6; --accent2:#b3b3b3;
-    --green:#5ec46a; --yellow:#f0c419; --red:#ff5347;
-    --accent-rgb:230,230,230; --on-accent:#0a0a0a;
-    --glow1:rgba(255,255,255,0.05); --glow2:rgba(255,255,255,0.03);
-    --grad-a:#000000; --grad-b:#0d0d0d;
-  }
-  /* MATRIX — phosphor green on black, and the display face drops to mono so
-     the headings read like a terminal rather than a poster. */
-  :root[data-theme="matrix"]{
-    --bg:#000000; --bg2:#04120a; --card:rgba(6,26,15,0.66); --border:rgba(0,255,102,0.22);
-    --txt:#ccffdd; --dim:#58a97a; --accent:#00ff66; --accent2:#7dffb0;
-    --green:#00ff66; --yellow:#d7ff5a; --red:#ff4d4d;
-    --accent-rgb:0,255,102; --on-accent:#001b0c;
-    --glow1:rgba(0,255,102,0.10); --glow2:rgba(0,120,50,0.14);
-    --grad-a:#000000; --grad-b:#031008;
-    --display:'SF Mono','Menlo','JetBrains Mono',ui-monospace,monospace;
-  }
-  *{box-sizing:border-box;margin:0;padding:0}
-  html,body{height:100%}
-  body{
-    font-family:'Avenir Next','SF Pro Text','Segoe UI',system-ui,sans-serif;
-    background:
-      radial-gradient(1100px 600px at 12% -10%, var(--glow1), transparent 60%),
-      radial-gradient(900px 500px at 90% 0%, var(--glow2), transparent 60%),
-      linear-gradient(160deg,var(--grad-a) 0%,var(--grad-b) 100%);
-    color:var(--txt); min-height:100vh; padding:24px 32px 60px;
-    letter-spacing:0.01em;
-  }
-  header{
-    display:flex;justify-content:space-between;align-items:center;
-    margin-bottom:18px;padding-bottom:16px;border-bottom:1px solid var(--border);
-    flex-wrap:wrap;gap:14px;
-  }
-  h1{
-    font-size:28px;font-weight:800;letter-spacing:0.02em;
-    background:linear-gradient(90deg,var(--accent) 0%,var(--accent2) 100%);
-    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-  }
-  .pulse{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--green);
-         box-shadow:0 0 12px var(--green);margin-right:8px;animation:p 2s infinite}
-  .pulse.warn{background:var(--yellow);box-shadow:0 0 12px var(--yellow)}
-  .pulse.bad{background:var(--red);box-shadow:0 0 12px var(--red)}
-  @keyframes p{0%,100%{opacity:1}50%{opacity:0.4}}
-  .meta{font-size:13px;color:var(--dim);text-align:right;line-height:1.6}
-  .meta .ts{color:var(--accent);font-variant-numeric:tabular-nums}
-
-  /* summary strip */
-  .summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:26px}
-  @media(max-width:760px){.summary{grid-template-columns:repeat(2,1fr)}}
-  .scard{
-    background:var(--card);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
-    border:1px solid var(--border);border-radius:14px;padding:14px 18px;
-    box-shadow:0 8px 30px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.04);
-  }
-  .scard .k{font-size:11px;letter-spacing:0.12em;text-transform:uppercase;color:var(--dim)}
-  .scard .v{font-size:30px;font-weight:800;font-variant-numeric:tabular-nums;margin-top:6px;line-height:1}
-  .scard .v .u{font-size:14px;color:var(--dim);font-weight:600;margin-left:4px}
-  .scard .v.neon{color:var(--accent)} .scard .v.violet{color:var(--accent2)}
-  .scard .v.red{color:var(--red)} .scard .v.green{color:var(--green)}
-  .scard .v.yellow{color:var(--yellow)}
-
-  .section-h{font-size:13px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;
-    color:var(--accent2);margin:8px 0 14px;display:flex;align-items:center;gap:10px}
-  .section-h.acc{color:var(--accent)}
-  .section-h .ln{flex:1;height:1px;background:linear-gradient(90deg,var(--border),transparent)}
-
-  h1,.section-h,.card h2,.scard .k,.modbar{font-family:var(--display)}
-  .scard .v,.row .val,.meta .ts,.pill{font-family:var(--mono);font-variant-numeric:tabular-nums}
-
-  /* -- Modules: collapse + rearrange --------------------------------------
-     Each panel is wrapped in .mod with its own .modbar handle. Collapse and
-     order are per-browser (localStorage) so the server stays stateless and a
-     wrecked layout is fixed by clearing two keys. */
-  .mod{display:block;margin-bottom:6px}
-  .modbar{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none;
-    font-size:12px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;
-    color:var(--accent2);padding:6px 8px;margin:6px 0 2px -8px;border-radius:8px;
-    transition:background .15s}
-  .modbar:hover{background:rgba(var(--accent-rgb),0.07)}
-  .modbar .chev{display:inline-block;transition:transform .18s;font-size:11px;opacity:.85}
-  .modbar .ln{flex:1;height:1px;background:linear-gradient(90deg,var(--border),transparent)}
-  .modbar .grip{display:none;cursor:grab;letter-spacing:-2px;color:var(--accent);
-    opacity:.75;font-size:14px}
-  .mod.collapsed .chev{transform:rotate(-90deg)}
-  .mod.collapsed .mod-body{display:none}
-  .mod.collapsed .modbar{opacity:.72}
-
-  .ctl{font-family:var(--display);background:rgba(var(--accent-rgb),0.10);color:var(--accent);
-    border:1px solid rgba(var(--accent-rgb),0.34);border-radius:8px;padding:6px 12px;
-    font-size:11px;font-weight:700;letter-spacing:0.1em;cursor:pointer;
-    transition:background .15s,color .15s}
-  .ctl:hover{background:rgba(var(--accent-rgb),0.20)}
-  .ctl:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-  .ctl.active{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
-
-  body.rearranging .mod{border:1px dashed rgba(var(--accent-rgb),0.45);border-radius:12px;
-    padding:8px 10px;margin-bottom:12px;background:rgba(var(--accent-rgb),0.03)}
-  body.rearranging .modbar .grip{display:inline-block}
-  body.rearranging .modbar{cursor:grab}
-  body.rearranging .mod.dragging{opacity:.45}
-  body.rearranging .mod.drop-target{border-color:var(--accent);
-    box-shadow:0 0 0 2px rgba(var(--accent-rgb),0.3)}
-  @media (prefers-reduced-motion:reduce){ .modbar,.modbar .chev,.ctl{transition:none} }
-  .section-h .badge{font-size:10px;padding:2px 8px;border-radius:8px;background:rgba(94,234,212,0.12);
-    color:var(--accent);border:1px solid rgba(94,234,212,0.3);letter-spacing:0.06em}
-  .section-h .badge.off{background:rgba(248,113,113,0.15);color:var(--red);border-color:rgba(248,113,113,0.3)}
-
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:18px;margin-bottom:22px}
-  .grid.solo{grid-template-columns:1fr}
-  .card{
-    background:var(--card);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
-    border:1px solid var(--border);border-radius:16px;padding:18px 20px;
-    box-shadow:0 8px 30px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.04);
-    transition:border-color 0.3s;
-  }
-  .card:hover{border-color:rgba(120,160,220,0.35)}
-  .card.stale{opacity:0.65;border-color:rgba(248,113,113,0.4)}
-  .card h2{
-    font-size:13px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;
-    color:var(--txt);margin-bottom:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-  }
-  .card h2 .badge{
-    font-size:10px;padding:2px 8px;border-radius:8px;background:rgba(94,234,212,0.12);
-    color:var(--accent);border:1px solid rgba(94,234,212,0.3);letter-spacing:0.06em;
-  }
-  .card h2 .badge.violet{background:rgba(167,139,250,0.12);color:var(--accent2);
-    border-color:rgba(167,139,250,0.3)}
-  .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
-  .dot.on{background:var(--green);box-shadow:0 0 9px var(--green)}
-  .dot.off{background:var(--red);box-shadow:0 0 9px var(--red)}
-
-  .row{display:flex;justify-content:space-between;align-items:baseline;padding:5px 0;font-size:13.5px}
-  .row .label{color:var(--dim)} .row .val{font-weight:600;font-variant-numeric:tabular-nums}
-  .big{font-size:38px;font-weight:800;font-variant-numeric:tabular-nums;letter-spacing:-0.02em;margin:2px 0}
-  .sub{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:0.12em}
-  .stack{display:flex;gap:16px;align-items:flex-end;margin-bottom:10px;flex-wrap:wrap}
-  .stack > div{flex:1;min-width:78px}
-
-  .pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:10.5px;
-    font-weight:700;letter-spacing:0.05em;text-transform:uppercase}
-  .pill.green{background:rgba(52,211,153,0.15);color:var(--green);border:1px solid rgba(52,211,153,0.3)}
-  .pill.yellow{background:rgba(251,191,36,0.15);color:var(--yellow);border:1px solid rgba(251,191,36,0.3)}
-  .pill.red{background:rgba(248,113,113,0.15);color:var(--red);border:1px solid rgba(248,113,113,0.3)}
-  .pill.muted{background:rgba(138,150,170,0.12);color:var(--dim);border:1px solid rgba(138,150,170,0.25)}
-
-  .bar{height:6px;background:rgba(255,255,255,0.05);border-radius:4px;overflow:hidden;margin:5px 0 2px}
-  .bar > span{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));
-    border-radius:4px;transition:width 0.4s}
-  .bar.temp > span{background:linear-gradient(90deg,var(--yellow),var(--red))}
-
-  .spark{margin-top:8px;height:34px;width:100%}
-  .spark path{fill:none;stroke:var(--accent);stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-  .spark .area{fill:url(#sparkfill);stroke:none}
-
-  /* per-model inference perf module */
-  .modcard{
-    background:linear-gradient(150deg,rgba(94,234,212,0.06),rgba(167,139,250,0.05)),var(--card);
-    border:1px solid rgba(94,234,212,0.22);
-  }
-  .perf{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:10px 0 6px}
-  .perf .pc{background:rgba(255,255,255,0.03);border:1px solid var(--border);
-    border-radius:10px;padding:9px 10px;text-align:center}
-  .perf .pc .pk{font-size:9.5px;color:var(--dim);letter-spacing:0.1em;text-transform:uppercase}
-  .perf .pc .pv{font-size:21px;font-weight:800;font-variant-numeric:tabular-nums;
-    margin-top:3px;line-height:1;color:var(--accent)}
-  .perf .pc .pv.violet{color:var(--accent2)}
-  .perf .pc .pv .pu{font-size:11px;color:var(--dim);font-weight:600;margin-left:3px}
-  .perf .pc.idle .pv{color:var(--dim)}
-  .liverow{display:flex;align-items:center;gap:8px;margin:6px 0 2px;padding:7px 10px;
-    border:1px solid rgba(167,139,250,0.35);border-radius:8px;
-    background:rgba(167,139,250,0.10);font-size:12.5px;font-weight:700;
-    font-variant-numeric:tabular-nums;color:var(--accent2)}
-  .liverow .ldot{width:7px;height:7px;border-radius:50%;background:var(--accent2);
-    box-shadow:0 0 8px var(--accent2);animation:lrpulse 1.2s ease-in-out infinite;flex:none}
-  .liverow .lsub{color:var(--dim);font-weight:600;font-size:11.5px;margin-left:auto}
-  @keyframes lrpulse{0%,100%{opacity:1}50%{opacity:0.35}}
-
-  /* fabric switch: fan grid + fabric-port throughput tiles */
-  .swcard{
-    background:linear-gradient(150deg,rgba(167,139,250,0.06),rgba(94,234,212,0.05)),var(--card);
-    border:1px solid rgba(167,139,250,0.22);
-  }
-  .ports{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:6px}
-  .port{background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px;padding:8px 10px}
-  .port .pn{font-size:11px;color:var(--dim);letter-spacing:0.04em}
-  .port .pr{font-size:14px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:2px}
-  .port .pt{font-size:10px;color:var(--accent);margin-top:2px}
-  .fans{display:grid;grid-template-columns:repeat(auto-fit,minmax(60px,1fr));gap:6px;margin-top:4px}
-  .fan{background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;
-    padding:6px 4px;text-align:center}
-  .fan .fk{font-size:9px;color:var(--dim)} .fan .fv{font-size:12px;font-weight:700;margin-top:2px}
-
-  .freshline{font-size:10.5px;color:var(--dim);margin-top:10px;letter-spacing:0.04em;
-    display:flex;justify-content:space-between;align-items:center}
-  .freshline.stale{color:var(--red)}
-  .err{color:var(--red);font-size:11.5px;margin-top:6px}
-  .footer{margin-top:24px;text-align:center;color:var(--dim);font-size:11px;
-    letter-spacing:0.1em;text-transform:uppercase}
-</style>
-</head>
-<body>
-<header>
-  <div>
-    <h1 id="title">⚡ Sparky Command Center</h1>
-    <div style="font-size:12px;color:var(--dim);margin-top:4px;letter-spacing:0.08em">
-      <span class="pulse" id="pulse"></span><span id="subtitle">read-only</span>
-    </div>
-  </div>
-  <div class="meta">
-    <div>updated <span class="ts" id="ts">-</span></div>
-    <div style="font-size:11px;margin-top:2px" id="refreshnote">browser refresh 2.5s</div>
-    <div style="margin-top:8px;display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap">
-      <div id="theme-wrap">
-        <button id="theme-btn" class="ctl" type="button" aria-haspopup="true" aria-expanded="false">&#9680; THEME</button>
-        <div id="theme-menu" role="menu" aria-label="Colour theme">
-          <button class="theme-opt" data-set="sunset" role="menuitemradio"><i style="--s1:#ff7a1a;--s2:#150e08"></i>SUNSET</button>
-          <button class="theme-opt" data-set="breeze" role="menuitemradio"><i style="--s1:#38bdf8;--s2:#0b1220"></i>BREEZE</button>
-          <button class="theme-opt" data-set="light"  role="menuitemradio"><i style="--s1:#0b6fd4;--s2:#f4f6f9"></i>LIGHT</button>
-          <button class="theme-opt" data-set="dark"   role="menuitemradio"><i style="--s1:#e6e6e6;--s2:#050505"></i>DARK</button>
-          <button class="theme-opt" data-set="matrix" role="menuitemradio"><i style="--s1:#00ff66;--s2:#000000"></i>MATRIX</button>
-        </div>
-      </div>
-      <button id="rearrange-btn" class="ctl" type="button">&#8645; REARRANGE</button>
-      <button id="expand-btn" class="ctl" type="button">&#9776; COLLAPSE ALL</button>
-    </div>
-  </div>
-</header>
-
-<svg width="0" height="0" style="position:absolute">
-  <defs>
-    <linearGradient id="sparkfill" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.38"/>
-      <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
-    </linearGradient>
-  </defs>
-</svg>
-
-<div class="summary" id="summary"></div>
-
-<div id="modules">
-  <section class="mod" data-mod="eco">
-    <div class="modbar"><span class="grip">&#8942;&#8942;</span><span class="chev">&#9662;</span>&#127811; Clock ECO Mode<span class="ln"></span></div>
-    <div class="mod-body">
-      <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:6px 2px">
-        <label style="display:flex;gap:6px;align-items:center">Node
-          <select id="eco-node"><option value="fleet">&#127760; WHOLE FLEET</option></select></label>
-        <label style="display:flex;gap:6px;align-items:center">Level
-          <select id="eco-level">
-            <option value="2200" selected>&#127811; ECO 2200 MHz</option>
-            <option value="2300">ECO 2300 MHz (light)</option>
-            <option value="2000">&#127811;&#127811; ECO 2000 MHz</option>
-            <option value="1800">&#127811;&#127811;&#127811; ECO 1800 MHz (deep saver)</option>
-            <option value="off">&#9940; OFF (full clocks)</option>
-          </select></label>
-        <button id="eco-apply">&#127811; Apply</button>
-        <button id="eco-check">&#128260; Status</button>
-        <a href="https://github.com/tonyd2wild/DGX-Spark-Hard-Poweroff-Fix" target="_blank" style="font-size:12px;opacity:.7">why?</a>
-        <div id="eco-out" style="flex-basis:100%;white-space:pre-line;font-family:monospace;font-size:12px;opacity:.8"></div>
-      </div>
-    </div>
-  </section>
-  <section class="mod" data-mod="tokens">
-    <div class="modbar"><span class="grip">&#8942;&#8942;</span><span class="chev">&#9662;</span>Token Tracker<span class="ln"></span></div>
-    <div class="mod-body"><div id="token-tracker"></div></div>
-  </section>
-  <section class="mod" data-mod="switch">
-    <div class="modbar"><span class="grip">&#8942;&#8942;</span><span class="chev">&#9662;</span>Fabric Switch<span class="ln"></span></div>
-    <div class="mod-body"><div id="switch"></div></div>
-  </section>
-  <section class="mod" data-mod="nodes">
-    <div class="modbar"><span class="grip">&#8942;&#8942;</span><span class="chev">&#9662;</span>Nodes<span class="ln"></span></div>
-    <div class="mod-body"><div id="nodes"></div></div>
-  </section>
-  <section class="mod" data-mod="fleetmodels">
-    <div class="modbar"><span class="grip">&#8942;&#8942;</span><span class="chev">&#9662;</span>Fleet Models<span class="ln"></span></div>
-    <div class="mod-body"><div id="fleet-models"></div></div>
-  </section>
-  <section class="mod" data-mod="video" id="mod-video" hidden>
-    <div class="modbar"><span class="grip">&#8942;&#8942;</span><span class="chev">&#9662;</span>Video Generation<span class="ln"></span></div>
-    <div class="mod-body"><div class="grid" id="comfy-grid"></div></div>
-  </section>
-</div>
-
-<div class="footer">READ-ONLY - polled over SSH + HTTP /metrics - never disturbs live inference</div>
-
-<script>
-function fmtTs(t){
-  if(!t) return '-';
-  return new Date(t*1000).toLocaleTimeString('en-US',{hour12:false});
-}
-function age(ts){ return ts? Math.max(0, Math.round(Date.now()/1000 - ts)) : null; }
-
-function tempPill(t, warn, hot){
-  if(t==null) return '<span class="pill muted">-</span>';
-  const c = t>=hot?'red':t>=warn?'yellow':'green';
-  return `<span class="pill ${c}">${t.toFixed(0)}°C</span>`;
-}
-
-function sparkline(values){
-  if(!values || values.length < 2) return '';
-  const W=300,H=34,pad=2;
-  const max=Math.max(...values,1), min=Math.min(...values,0);
-  const range=Math.max(max-min,1);
-  const step=(W-pad*2)/(values.length-1);
-  const pts=values.map((v,i)=>{
-    const x=pad+i*step;
-    const y=H-pad-((v-min)/range)*(H-pad*2);
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  });
-  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
-    <path class="area" d="M ${pad},${H-pad} L ${pts.join(' L ')} L ${(W-pad).toFixed(1)},${H-pad} Z"/>
-    <path d="M ${pts.join(' L ')}"/></svg>`;
-}
-
-function freshLine(ts, err){
-  const a = age(ts);
-  const stale = a==null || a>20;
-  const txt = a==null ? 'no data' : (a+'s ago');
-  return `<div class="freshline ${stale?'stale':''}">
-    <span>${err? '⚠ '+escH(err) : (stale?'STALE':'live')}</span>
-    <span>updated ${txt}</span></div>`;
-}
-
-function escH(s){
-  return String(s==null?'':s).replace(/[&<>"']/g,
-    c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
-function renderGpu(node, g, hist){
-  const sp = hist['node:'+node.key+':'+g.index+':temp'];
-  const pl = g.power_limit||350;
-  const warn = node.temp_warn, hot = node.temp_hot;
-  return `<div class="card">
-    <h2><span class="dot on"></span>GPU ${g.index} <span class="badge">${escH(g.name)}</span></h2>
-    <div class="stack">
-      <div><div class="sub">Temp</div>
-        <div class="big">${g.temp!=null?g.temp.toFixed(0):'-'}<span style="font-size:16px;color:var(--dim)">°C</span></div>
-        ${tempPill(g.temp,warn,hot)}</div>
-      <div><div class="sub">Power</div>
-        <div class="big">${g.power!=null?g.power.toFixed(0):'-'}<span style="font-size:16px;color:var(--dim)">W</span></div>
-        <span class="pill ${g.power>pl*0.85?'red':g.power>pl*0.55?'yellow':'green'}">${g.power!=null?(g.power/pl*100).toFixed(0):'-'}% cap</span></div>
-    </div>
-    <div class="row"><span class="label">Utilization</span><span class="val">${g.util!=null?g.util.toFixed(0):'-'} %</span></div>
-    <div class="bar"><span style="width:${g.util||0}%"></span></div>
-    <div class="row"><span class="label">VRAM</span><span class="val">${g.mem_used_mb!=null?(g.mem_used_mb/1024).toFixed(1):'-'} / ${g.mem_total_mb!=null?(g.mem_total_mb/1024).toFixed(1):'-'} GiB</span></div>
-    <div class="bar"><span style="width:${g.mem_pct||0}%"></span></div>
-    <div class="row"><span class="label">Fan</span><span class="val">${g.fan!=null?g.fan.toFixed(0)+' %':'-'}</span></div>
-    <div class="row"><span class="label">Graphics clock</span><span class="val">${g.gr_clock!=null?g.gr_clock.toFixed(0)+' MHz':'-'}</span></div>
-    ${sparkline(sp)}
-  </div>`;
-}
-
-function renderNodeSys(node){
-  const reach = node.reachable;
-  return `<div class="card ${reach?'':'stale'}">
-    <h2><span class="dot ${reach?'on':'off'}"></span>${escH(node.name)} - system
-      <span class="badge violet">HOST</span></h2>
-    ${reach? `
-    <div class="stack">
-      <div><div class="sub">Host Temp</div>
-        <div class="big">${node.cpu_temp!=null?node.cpu_temp.toFixed(0):'-'}<span style="font-size:16px;color:var(--dim)">°C</span></div>
-        ${tempPill(node.cpu_temp,node.temp_warn+5,node.temp_hot+6)}</div>
-    </div>
-    ${(node.cpu_temps||[]).slice(1).map((t,i)=>`<div class="row"><span class="label">host sensor #${i+2}</span><span class="val">${t.toFixed(1)} °C</span></div>`).join('')}
-    <div class="row"><span class="label">System RAM</span><span class="val">${node.mem_used_mb!=null?(node.mem_used_mb/1024).toFixed(1):'-'} / ${node.mem_total_mb!=null?(node.mem_total_mb/1024).toFixed(1):'-'} GiB</span></div>
-    <div class="bar"><span style="width:${node.mem_pct||0}%"></span></div>
-    <div class="row"><span class="label">GPUs</span><span class="val">${(node.gpus||[]).length}</span></div>
-    ${freshLine(node.ts)}
-    ` : `<div class="err">node unreachable - ${escH(node.err||'no response')}</div>${freshLine(node.ts, node.err)}`}
-  </div>`;
-}
-
-function fmtTok(n){
-  n = +n || 0;
-  if(n >= 1e9) return (n/1e9).toFixed(2)+'B';
-  if(n >= 1e6) return (n/1e6).toFixed(2)+'M';
-  if(n >= 1e3) return (n/1e3).toFixed(1)+'K';
-  return String(Math.round(n));
-}
-function renderTokens(tk){
-  if(!tk || !tk.enabled || !(tk.models && tk.models.length)) return '';
-  const cards = tk.models.map(m=>{
-    const on = m.reachable;
-    return `<div class="card modcard${on?'':' stale'}">
-      <h2><span class="dot ${on?'on':'off'}"></span>${escH(m.label||m.key)}
-        ${m.gpus?`<span class="badge violet">${escH(m.gpus)}</span>`:''}</h2>
-      <div class="big" style="color:var(--accent)">${fmtTok(m.total_tokens)}</div>
-      <div class="sub">tokens served · cumulative</div>
-      <div class="stack" style="margin-top:12px">
-        <div><div class="sub">prompt</div><div class="val" style="font-size:17px">${fmtTok(m.total_prompt)}</div></div>
-        <div><div class="sub">generated</div><div class="val" style="font-size:17px">${fmtTok(m.total_gen)}</div></div>
-        <div><div class="sub">today</div><div class="val" style="font-size:17px;color:var(--accent2)">${fmtTok(m.today_tokens)}</div></div>
-      </div>
-    </div>`;
-  }).join('');
-  return `<div class="section-h">🎫 Token Tracker
-      <span class="badge">${fmtTok(tk.total)} total</span>
-      <span class="badge violet">${fmtTok(tk.today)} today</span>
-      <span class="ln"></span></div>
-    <div class="grid">${cards}</div>`;
-}
-function liveReqRow(m){
-  // Pops only while requests are in flight: per-request decode speed.
-  // decode_tps is the whole engine's rate over the last poll window, so with
-  // N running the honest per-request figure is the ~N-way split.
-  const n = m.running||0;
-  const d = m.decode_tps;
-  if(!n || d==null) return '';
-  if(d<=0){
-    const pf = m.prefill_tps;
-    return `<div class="liverow"><span class="ldot"></span>${n} live · ${pf>0? 'prefilling '+fmtTps(pf)+' tok/s' : 'starting up'}<span class="lsub">no decode yet</span></div>`;
-  }
-  const per = fmtTps(d/n);
-  return n>1
-    ? `<div class="liverow"><span class="ldot"></span>${n} live · ~${per} tok/s each<span class="lsub">${fmtTps(d)} combined</span></div>`
-    : `<div class="liverow"><span class="ldot"></span>1 live · ${per} tok/s<span class="lsub">decode</span></div>`;
-}
-function fmtTps(v){
-  if(v==null) return '-';
-  return v>=100? v.toFixed(0) : v.toFixed(1);
-}
-function renderModel(m){
-  const reach = m.reachable;
-  const cls = reach? '':'stale';
-  const engine = m.engine || 'inference';
-  const busy = (m.running||0) > 0;
-  const idleCls = (reach && !busy)? ' idle':'';
-  const ttft = m.ttft_ms!=null ? (m.ttft_ms>=1000? (m.ttft_ms/1000).toFixed(2)+'<span class="pu">s</span>' : m.ttft_ms.toFixed(0)+'<span class="pu">ms</span>') : '-';
-  return `<div class="card modcard ${cls}">
-    <h2><span class="dot ${reach?'on':'off'}"></span>${escH(m.label)}
-      <span class="badge">${escH(engine)}</span>
-      ${m.port?`<span class="badge">:${m.port}</span>`:''}
-      ${busy?'<span class="badge violet">BUSY</span>':'<span class="badge" style="background:rgba(138,150,170,0.12);color:var(--dim);border-color:rgba(138,150,170,0.25)">idle</span>'}</h2>
-    ${reach? `
-    <div class="row"><span class="label">Model</span><span class="val" style="font-family:'SF Mono',ui-monospace,Menlo,monospace;font-size:12px;color:var(--accent)">${escH(m.model||'-')}</span></div>
-    <div class="perf">
-      <div class="pc${idleCls}"><div class="pk">Decode</div><div class="pv">${fmtTps(m.decode_tps)}<span class="pu">tok/s</span></div></div>
-      <div class="pc${idleCls}"><div class="pk">Prefill</div><div class="pv violet">${fmtTps(m.prefill_tps)}<span class="pu">tok/s</span></div></div>
-      <div class="pc${idleCls}"><div class="pk">TTFT avg</div><div class="pv">${ttft}</div></div>
-    </div>
-    <div class="row"><span class="label">KV-cache</span><span class="val">${m.kv_pct!=null?m.kv_pct.toFixed(1)+' %':'-'}</span></div>
-    <div class="bar"><span style="width:${m.kv_pct||0}%"></span></div>
-    <div class="row"><span class="label">Requests</span><span class="val">${m.running!=null?m.running:'-'} running · ${m.waiting!=null?m.waiting:'-'} waiting</span></div>
-    ${liveReqRow(m)}
-    ${m.gpus?`<div class="row"><span class="label">On</span><span class="val">${escH(m.gpus)}</span></div>`:''}
-    ${freshLine(m.ts)}
-    ` : `<div class="err">${escH(m.label)} offline - ${escH(m.err||'no /metrics')}</div>${freshLine(m.ts, m.err)}`}
-  </div>`;
-}
-
-function fmtBps(bps){
-  if(bps==null) return '0';
-  if(bps>=1e9) return (bps/1e9).toFixed(2)+' Gb/s';
-  if(bps>=1e6) return (bps/1e6).toFixed(1)+' Mb/s';
-  if(bps>=1e3) return (bps/1e3).toFixed(0)+' Kb/s';
-  return bps.toFixed(0)+' b/s';
-}
-
-function renderSwitch(sw){
-  if(!sw) return '';
-  const reach = sw.reachable;
-  const h = sw.health||{}, r = sw.resource||{};
-  const warn = sw.temp_warn||55, hot = sw.temp_hot||70;
-  const swTemp = h['switch-temperature']!=null? parseFloat(h['switch-temperature']):null;
-  const cpuTemp = h['cpu-temperature']!=null? parseFloat(h['cpu-temperature']):null;
-  const ports = sw.ports||[];
-  const fanKeys = Object.keys(h).filter(k=>/^fan\d+-speed$/.test(k))
-    .sort((a,b)=>parseInt(a.replace(/\D/g,''))-parseInt(b.replace(/\D/g,'')));
-  const psuOk = (h['psu1-state']==='ok' && h['psu2-state']==='ok');
-  return `<div class="section-h">◢ ${escH(sw.name)}
-    <span class="badge ${reach?'':'off'}">${reach?escH(sw.badge||'FABRIC'):'OFFLINE'}</span><span class="ln"></span></div>
-  <div class="grid solo"><div class="card swcard ${reach?'':'stale'}">
-    <h2><span class="dot ${reach?'on':'off'}"></span>${escH(sw.name)}
-      <span class="badge violet">${escH(sw.badge||'FABRIC')}</span></h2>
-    ${reach? `
-    <div class="stack">
-      <div><div class="sub">Switch Temp</div>
-        <div class="big">${swTemp!=null?swTemp.toFixed(0):'-'}<span style="font-size:16px;color:var(--dim)">°C</span></div>
-        ${tempPill(swTemp,warn,hot)}</div>
-      <div><div class="sub">CPU Temp</div>
-        <div class="big">${cpuTemp!=null?cpuTemp.toFixed(0):'-'}<span style="font-size:16px;color:var(--dim)">°C</span></div>
-        ${tempPill(cpuTemp,warn+5,hot+5)}</div>
-    </div>
-    ${fanKeys.length?`<div class="row"><span class="label">Fans <span style="color:var(--green)">${escH(h['fan-state']||'')}</span></span>
-      <span class="val">${h['psu1-state']||h['psu2-state']?(psuOk?'2 PSU ok':'PSU?'):''}</span></div>
-    <div class="fans">${fanKeys.map((f,i)=>`<div class="fan"><div class="fk">FAN${i+1}</div><div class="fv">${escH(h[f])}</div></div>`).join('')}</div>`:''}
-    ${h['psu1-power']!=null?`<div class="row" style="margin-top:8px"><span class="label">PSU1</span><span class="val">${escH(h['psu1-power'])} W · ${escH(h['psu1-temperature']||'-')}°C</span></div>`:''}
-    ${h['psu2-power']!=null?`<div class="row"><span class="label">PSU2</span><span class="val">${escH(h['psu2-power'])} W · ${escH(h['psu2-temperature']||'-')}°C</span></div>`:''}
-    ${r['uptime']?`<div class="row"><span class="label">Uptime</span><span class="val">${escH(r['uptime'])}</span></div>`:''}
-    ${r['version']?`<div class="row"><span class="label">RouterOS</span><span class="val">${escH(r['version'].split(' ')[0])} · cpu ${escH(r['cpu-load']||'-')}</span></div>`:''}
-    ${ports.length?`<div class="sub" style="margin-top:10px">Fabric ports · live throughput</div>
-    <div class="ports">${ports.map(p=>`<div class="port"><div class="pn">${escH(p.name)} <span class="pill ${p.running?'green':'muted'}" style="padding:1px 6px">${p.running?'link-ok':'down'}</span></div>
-      <div class="pr">${fmtBps((p.rx_bps||0)+(p.tx_bps||0))}</div>
-      <div class="pt">${p.rate?escH(p.rate)+' · ':''}↓${fmtBps(p.rx_bps)} ↑${fmtBps(p.tx_bps)}</div></div>`).join('')}</div>`:''}
-    ${freshLine(sw.ts)}
-    ` : `<div class="err">switch unreachable - ${escH(sw.err||'no response')}</div>${freshLine(sw.ts, sw.err)}`}
-  </div></div>`;
-}
-
-function renderNode(node, hist){
-  const gpus = node.gpus||[];
-  const models = node.models||[];
-  const reach = node.reachable;
-  let html = `<div class="section-h">◢ ${escH(node.name)}
-    <span class="badge ${reach?'':'off'}">${reach?(gpus.length+' GPU'):'OFFLINE'}</span><span class="ln"></span></div>`;
-  if(gpus.length){
-    html += `<div class="grid">${gpus.map(g=>renderGpu(node,g,hist)).join('')}</div>`;
-  }
-  html += `<div class="grid solo">${renderNodeSys(node)}</div>`;
-  if(models.length){
-    html += `<div class="section-h acc">▸ Model performance<span class="ln"></span></div>`;
-    html += `<div class="grid">${models.map(m=>renderModel(m)).join('')}</div>`;
-  }
-  return html;
-}
-
-function render(s){
-  document.title = s.title || 'LLM Fleet Monitor';
-  document.getElementById('title').textContent = s.title || 'LLM Fleet Monitor';
-  document.getElementById('subtitle').textContent = s.subtitle || 'read-only';
-  document.getElementById('ts').textContent = fmtTs(s.ts);
-  if(s.browser_refresh_ms){
-    document.getElementById('refreshnote').textContent = 'browser refresh '+(s.browser_refresh_ms/1000)+'s';
-  }
-  const agg = s.agg||{};
-  const fleetStatus = agg.status || (agg.all_ok ? 'ok' : 'degraded');
-  const statusUi = {
-    ok:       {label:'ALL OK',   color:'green',  pulse:''},
-    warning:  {label:'WARNING',  color:'yellow', pulse:' warn'},
-    hot:      {label:'HOT',      color:'red',    pulse:' bad'},
-    degraded: {label:'DEGRADED', color:'red',    pulse:' bad'}
-  }[fleetStatus] || {label:'DEGRADED', color:'red', pulse:' bad'};
-  document.getElementById('pulse').className = 'pulse' + statusUi.pulse;
-  const issueTitle = escH((agg.issues||[]).join(' · '));
-
-  document.getElementById('summary').innerHTML = `
-    <div class="scard"><div class="k">Fleet GPUs</div><div class="v neon">${agg.gpu_count!=null?agg.gpu_count:'-'}<span class="u">online</span></div></div>
-    <div class="scard"><div class="k">Total Power Draw</div><div class="v violet">${agg.total_power!=null?agg.total_power:'-'}<span class="u">W</span></div></div>
-    <div class="scard"><div class="k">Hottest GPU</div><div class="v ${agg.hottest_temp>=84?'red':'green'}" style="font-size:22px">${escH(agg.hottest_unit||'-')}<span class="u">${agg.hottest_temp!=null?agg.hottest_temp.toFixed(0)+'°C':''}</span></div></div>
-    <div class="scard" title="${issueTitle}"><div class="k">Fleet Status</div><div class="v ${statusUi.color}" style="font-size:22px">● ${statusUi.label}</div></div>`;
-
-  document.getElementById('token-tracker').innerHTML = renderTokens(s.tokens);
-
-  const hist = s.history||{};
-  document.getElementById('switch').innerHTML = renderSwitch(s.switch);
-  document.getElementById('nodes').innerHTML =
-    (s.nodes||[]).map(n=>renderNode(n,hist)).join('');
-
-  // Fleet-wide model instances (not tied to a single node), grouped by label.
-  const fm = s.fleet_models||[];
-  let fmHtml = '';
-  if(fm.length){
-    const groups = {};
-    fm.forEach(m=>{ const g=m.group||'Fleet models'; (groups[g]=groups[g]||[]).push(m); });
-    Object.keys(groups).forEach(g=>{
-      fmHtml += `<div class="section-h acc">▸ ${escH(g)}<span class="ln"></span></div>`;
-      fmHtml += `<div class="grid">${groups[g].map(m=>renderModel(m)).join('')}</div>`;
-    });
-  }
-  document.getElementById('fleet-models').innerHTML = fmHtml;
-}
-
-let interval = 2500;
-async function tick(){
-  try{
-    const r = await fetch('/api/metrics',{cache:'no-store'});
-    const s = await r.json();
-    render(s);
-    if(s.browser_refresh_ms && s.browser_refresh_ms !== interval){
-      interval = s.browser_refresh_ms;
-      clearInterval(timer); timer = setInterval(tick, interval);
-    }
-  }catch(e){
-    document.getElementById('ts').textContent = 'FETCH ERR: '+e.message;
-  }
-}
-tick();
-let timer = setInterval(tick, interval);
-
-// -- Video generation lanes (ComfyUI-style image/video servers) --------------
-// Hidden entirely when no lanes are configured, so the panel costs nothing to
-// a deployment that has none. VRAM is the live number to watch during a
-// render; `peak while rendering` is the capacity-planning number.
-function fmtGB(b){ return b==null ? '-' : (b/1073741824).toFixed(1); }
-function renderComfy(lanes){
-  return lanes.map(function(l){
-    var dead = !l.reachable;
-    var tot = l.vram_total, used = l.vram_used;
-    var pct = (tot && used!=null) ? Math.min(100,(used/tot)*100) : 0;
-    var col = dead ? 'var(--dim)' : pct>85 ? 'var(--red)' : pct>60 ? 'var(--yellow)' : 'var(--green)';
-    var state = dead ? '\u25cf offline' : l.busy ? '\u25cf RENDERING' : '\u25cf idle';
-    var stcol = dead ? 'var(--red)' : l.busy ? 'var(--accent)' : 'var(--green)';
-    var queue = (l.running||0)+(l.pending||0);
-    return '<div class="scard" style="text-align:left;padding:16px 18px">'
-      + '<div class="k" style="display:flex;justify-content:space-between;align-items:center">'
-      + '<span><span class="badge">LANE '+escH(l.lane)+'</span> '+escH(l.name||'')+'</span>'
-      + '<span style="color:'+stcol+';font-size:11px">'+state+'</span></div>'
-      + '<div class="v neon" style="font-size:28px">'+fmtGB(used)+'<span class="u">GB used</span></div>'
-      + '<div style="height:6px;border-radius:3px;background:rgba(255,255,255,.08);margin:8px 0 6px">'
-      + '<div style="height:100%;width:'+pct.toFixed(1)+'%;border-radius:3px;background:'+col+'"></div></div>'
-      + '<div style="color:var(--dim);font-size:12px;display:flex;gap:16px;flex-wrap:wrap">'
-      + '<span>'+fmtGB(l.vram_free)+' GB free of '+fmtGB(tot)+'</span><span>queue '+queue+'</span></div>'
-      + '<div style="font-size:12px;margin-top:6px;display:flex;gap:16px;flex-wrap:wrap">'
-      + '<span style="color:var(--accent2)">peak while rendering <b>'
-      + (l.peak_busy!=null?fmtGB(l.peak_busy)+' GB':'-')+'</b></span>'
-      + '<span style="color:var(--dim)">peak any '+fmtGB(l.peak_used)+' GB</span></div>'
-      + '<div style="margin-top:10px"><a href="'+escH(l.url)+'" target="_blank" rel="noopener" '
-      + 'style="color:var(--accent);font-size:13px;text-decoration:none">open UI &nbsp;'
-      + escH((l.url||'').replace('http://',''))+' &rarr;</a></div>'
-      + '<div style="color:var(--dim);font-size:11px;margin-top:4px">'+escH(l.host||'')
-      + (l.version?' \u00b7 v'+escH(l.version):'')+'</div></div>';
-  }).join('');
-}
-async function tickComfy(){
-  try{
-    const r = await fetch('/api/comfy',{cache:'no-store'});
-    const lanes = (await r.json()).lanes||[];
-    document.getElementById('mod-video').hidden = lanes.length===0;
-    if(lanes.length) document.getElementById('comfy-grid').innerHTML = renderComfy(lanes);
-  }catch(e){}
-}
-tickComfy();
-setInterval(tickComfy, 5000);
-
-// -- Module collapse + rearrange --------------------------------------------
-// Per-browser layout in localStorage; the server stays stateless. A saved
-// order lists data-mod keys: unknown keys are ignored and a module missing
-// from the saved order keeps its place, so adding a panel later never
-// strands it off-screen.
-// ── Theme picker ───────────────────────────────────────────────────────────
-// Sunset is the default and is plain :root, so an unset/corrupt value falls
-// back to it rather than to an unstyled page.
-const THEMES=['sunset','breeze','light','dark','matrix'];
-const LS_THEME='acc.theme.v1';
-function applyTheme(name){
-  const t = THEMES.includes(name) ? name : 'sunset';
-  // sunset is the base :root, so it carries no attribute at all
-  if(t==='sunset') document.documentElement.removeAttribute('data-theme');
-  else document.documentElement.setAttribute('data-theme',t);
-  document.querySelectorAll('.theme-opt').forEach(b=>
-    b.setAttribute('aria-checked', String(b.dataset.set===t)));
-  try{ localStorage.setItem(LS_THEME,t); }catch(e){}
-}
-(function initTheme(){
-  let t; try{ t=localStorage.getItem(LS_THEME); }catch(e){}
-  applyTheme(t||'sunset');
-})();
-const themeBtn=document.getElementById('theme-btn');
-const themeMenu=document.getElementById('theme-menu');
-function closeThemeMenu(){ themeMenu.classList.remove('open'); themeBtn.setAttribute('aria-expanded','false'); }
-themeBtn.addEventListener('click', ev=>{
-  ev.stopPropagation();
-  const open=themeMenu.classList.toggle('open');
-  themeBtn.setAttribute('aria-expanded',String(open));
-});
-themeMenu.addEventListener('click', ev=>{
-  const opt=ev.target.closest('.theme-opt');
-  if(!opt) return;
-  ev.stopPropagation();
-  applyTheme(opt.dataset.set);
-  closeThemeMenu();
-});
-document.addEventListener('click', ev=>{
-  if(!ev.target.closest('#theme-wrap')) closeThemeMenu();
-});
-document.addEventListener('keydown', ev=>{ if(ev.key==='Escape') closeThemeMenu(); });
-
-const LS_ORDER='fleet.modOrder', LS_COLLAPSED='fleet.modCollapsed';
-const modBox=document.getElementById('modules');
-function mods(){ return [].slice.call(modBox.querySelectorAll(':scope > .mod')); }
-function findMod(id){
-  return modBox.querySelector(':scope > .mod[data-mod="'+CSS.escape(id)+'"]');
-}
-function saveOrder(){
-  try{ localStorage.setItem(LS_ORDER, JSON.stringify(mods().map(m=>m.dataset.mod))); }catch(e){}
-}
-function saveCollapsed(){
-  try{ localStorage.setItem(LS_COLLAPSED,
-    JSON.stringify(mods().filter(m=>m.classList.contains('collapsed')).map(m=>m.dataset.mod))); }catch(e){}
-}
-function restore(key, fn){
-  let ids; try{ ids=JSON.parse(localStorage.getItem(key)||'null'); }catch(e){}
-  if(Array.isArray(ids)) ids.forEach(id=>{ const el=findMod(id); if(el) fn(el); });
-}
-function syncExpandBtn(){
-  document.getElementById('expand-btn').innerHTML =
-    mods().some(m=>m.classList.contains('collapsed')) ? '&#9776; EXPAND ALL' : '&#9776; COLLAPSE ALL';
-}
-modBox.addEventListener('click', ev=>{
-  const bar = ev.target.closest('.modbar');
-  if(!bar || document.body.classList.contains('rearranging')) return;
-  bar.parentElement.classList.toggle('collapsed');
-  saveCollapsed(); syncExpandBtn();
-});
-document.getElementById('expand-btn').addEventListener('click', ()=>{
-  const any = mods().some(m=>m.classList.contains('collapsed'));
-  mods().forEach(m=>m.classList.toggle('collapsed', !any));
-  saveCollapsed(); syncExpandBtn();
-});
-let dragEl=null;
-const rearrangeBtn=document.getElementById('rearrange-btn');
-rearrangeBtn.addEventListener('click', ()=>{
-  const on = document.body.classList.toggle('rearranging');
-  rearrangeBtn.classList.toggle('active', on);
-  rearrangeBtn.innerHTML = on ? '&#10003; DONE' : '&#8645; REARRANGE';
-  mods().forEach(m=>{ m.draggable = on; });
-});
-modBox.addEventListener('dragstart', ev=>{
-  const m=ev.target.closest('.mod'); if(!m) return;
-  dragEl=m; m.classList.add('dragging');
-  ev.dataTransfer.effectAllowed='move';
-  ev.dataTransfer.setData('text/plain', m.dataset.mod);
-});
-modBox.addEventListener('dragend', ()=>{
-  if(dragEl) dragEl.classList.remove('dragging');
-  modBox.querySelectorAll('.drop-target').forEach(e=>e.classList.remove('drop-target'));
-  dragEl=null; saveOrder();
-});
-modBox.addEventListener('dragover', ev=>{
-  if(!dragEl) return;
-  ev.preventDefault(); ev.dataTransfer.dropEffect='move';
-  const over=ev.target.closest('.mod');
-  if(!over || over===dragEl) return;
-  modBox.querySelectorAll('.drop-target').forEach(e=>e.classList.remove('drop-target'));
-  over.classList.add('drop-target');
-  const r=over.getBoundingClientRect();
-  modBox.insertBefore(dragEl, ev.clientY > r.top + r.height/2 ? over.nextSibling : over);
-});
-modBox.addEventListener('drop', ev=>ev.preventDefault());
-restore(LS_ORDER, el=>modBox.appendChild(el));
-restore(LS_COLLAPSED, el=>el.classList.add('collapsed'));
-syncExpandBtn();
-// --- Clock ECO Mode -------------------------------------------------------
-(function(){
-  const out=document.getElementById('eco-out');
-  const nodeSel=document.getElementById('eco-node');
-  fetch('/api/metrics').then(r=>r.json()).then(d=>{
-    (d.nodes||[]).forEach(n=>{
-      const o=document.createElement('option');o.value=n.key;o.textContent=n.name;nodeSel.appendChild(o);
-    });
-  }).catch(()=>{});
-  document.getElementById('eco-check').onclick=async()=>{
-    out.textContent='reading clocks on all nodes…';
-    try{const r=await fetch('/api/eco-status');const d=await r.json();
-      out.textContent=Object.entries(d.status).map(([n,v])=>n.toUpperCase()+':  '+v).join('\n')
-        +(d.writes_enabled?'':'\n(writes disabled — create eco_key.txt next to server.py to enable Apply)');
-    }catch(e){out.textContent='status failed: '+e;}
-  };
-  document.getElementById('eco-apply').onclick=async()=>{
-    let key=localStorage.getItem('ecoKey');
-    if(!key){key=prompt('ECO control key (contents of eco_key.txt):')||'';if(key)localStorage.setItem('ecoKey',key);}
-    const node=nodeSel.value, lvl=document.getElementById('eco-level').value;
-    if(node==='fleet'&&!confirm('Apply '+lvl+' to the WHOLE fleet?'))return;
-    out.textContent='applying '+lvl+' to '+node+'…';
-    try{const r=await fetch('/api/eco-set?node='+node+'&level='+lvl+'&key='+encodeURIComponent(key));
-      const d=await r.json();
-      if(!d.ok){out.textContent='blocked: '+d.error;if((d.error||'').includes('key'))localStorage.removeItem('ecoKey');return;}
-      out.textContent='applied '+d.applied+'\n'+Object.entries(d.nodes).map(([n,v])=>n.toUpperCase()+':  '+(v||'ok')).join('\n');
-    }catch(e){out.textContent='apply failed: '+e;}
-  };
-})();
-</script>
-</body>
-</html>"""
+def _resolve_expect():
+    """Resolve a bare 'expect' in switch.exec.argv to an installed binary."""
+    ex = (SWITCH or {}).get("exec") or {}
+    argv = ex.get("argv") or []
+    if argv and argv[0] == "expect":
+        for cand in ("/opt/homebrew/bin/expect", "/usr/local/bin/expect", "/usr/bin/expect"):
+            if os.path.exists(cand):
+                argv[0] = cand
+                break
 
 
 def main():
-    global CFG, TOKEN_STORE
-    CFG = load_config()
-    if CFG["server"].get("token_tracking", True):
-        store = CFG["server"].get("token_store") or "data/token_usage.json"
-        TOKEN_STORE = os.path.expanduser(store)
-        _load_tokens()
+    _resolve_expect()
     start_pollers()
-    bind, port = CFG["server"]["bind"], int(CFG["server"]["port"])
-    httpd = ThreadingHTTPServer((bind, port), Handler)
-    print(f"{CFG['server']['title']} on http://{bind}:{port}  "
-          f"({len(CFG['nodes'])} nodes, {len(CFG['models'])} models)")
-    httpd.serve_forever()
+    port = int(CFG["server"]["port"])
+    binds = CFG["server"]["bind"] or ["127.0.0.1"]
+    servers = []
+    for addr in binds:
+        for attempt in range(30):
+            try:
+                servers.append(ThreadingHTTPServer((addr, port), Handler))
+                break
+            except OSError as e:
+                if attempt == 29:
+                    sys.stderr.write("could not bind %s:%s (%s)\n" % (addr, port, e))
+                time.sleep(2)
+    if not servers:
+        sys.exit(1)
+    for s in servers[1:]:
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    print("Command Center v%s on %s (port %s) config=%s read_only=%s chat=%s"
+          % (VERSION, ", ".join(binds), port, CFG_PATH or "(defaults)", READ_ONLY,
+             "configured" if chat_endpoints() else "not configured"), flush=True)
+    servers[0].serve_forever()
 
 
 if __name__ == "__main__":
