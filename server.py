@@ -1236,6 +1236,7 @@ def snapshot():
         "read_only": READ_ONLY,
         "nodes": nodes,
         "storage": storage,
+        "catalog": _build_catalog(storage),
         "sparks": unified,             # v1 name, kept for API consumers
         "switch": switch or {"reachable": False, "ts": 0, "err": "not configured"},
         "box": legacy_box,             # v1 name: the first discrete host
@@ -1363,6 +1364,268 @@ def _gib(n):
     return "%.1f" % (n / (1024.0 ** 3))
 
 
+def _machine_mark(name):
+    parts = (name or "").replace("·", " ").split()
+    if parts and len(parts[-1]) == 1 and parts[-1].isalpha():
+        return parts[-1].upper()
+    return (name or "?")[:3]
+
+
+def _describe_checkpoint(name):
+    """Plain-English family and variant. The folder name is the identity across machines."""
+    n = (name or "").lower()
+    if "deepseek" in n and "uncensored" in n:
+        return "DeepSeek V4.1 Flash", "Uncensored copy, stored as FP8."
+    if n == "dsv41-native" or "dsv41" in n:
+        return "DeepSeek V4.1 Flash", "The original weights."
+    if "minimax" in n:
+        return "MiniMax M3", "The build made for these Sparks."
+    if "qwen" in n:
+        if "a3b" in n and "fp8" in n:
+            return "Qwen 3.5", "The A3B size, stored as FP8."
+        return "Qwen 3.5", "Local weights."
+    if "glm" in n or "dflash" in n:
+        if "derisk" in n:
+            variant = "Derisked attention. A full second copy of the weights."
+        elif "int4" in n or "int8" in n:
+            variant = "Int4 and int8 mixed in one checkpoint."
+        elif "uncensored" in n:
+            variant = "Uncensored copy, EXL3."
+        elif "nvidia" in n:
+            variant = "NVIDIA attention. This is the production checkpoint."
+        elif "dflash" in n and "full" in n:
+            variant = "DFlash draft, the full tree."
+        elif n == "glm-5.3-flash-dflash2":
+            variant = "DFlash draft. The small file that sits beside the main weights."
+        elif "draft" in n:
+            variant = "DFlash draft, the small copy."
+        elif "dflash" in n:
+            variant = "A separate DFlash draft."
+        else:
+            variant = "Another checkpoint of this model (%s)." % name
+        return "GLM 5.3 Flash", variant
+    return name or "Unknown weights", "Weights on disk."
+
+
+def _describe_image(tags):
+    blob = " ".join(tags or []).lower()
+    if "vllm-glm" in blob:
+        return "Server images", "vLLM image for GLM 5.3 Flash.", "vllm-glm53"
+    if "sglang" in blob or "dsv41" in blob:
+        if "canary" in blob or "roce" in blob:
+            label, slug = "SGLang image for DeepSeek, the RoCE canary.", "dsv41-canary"
+        elif "dev-dsv41" in blob:
+            label, slug = "SGLang image for DeepSeek, the upstream dev tag.", "dsv41-dev"
+        elif "nfs" in blob:
+            label, slug = "SGLang image for DeepSeek, a small NFS build.", "dsv41-nfs"
+        elif ":local" in blob:
+            label, slug = "SGLang image for DeepSeek, a local build.", "dsv41-local"
+        else:
+            label, slug = "SGLang image for DeepSeek.", "dsv41-other"
+        return "Server images", label, slug
+    if "recipe-full" in blob or "nvfp4-dflash" in blob:
+        return "GLM build images", "Full image from the NVFP4 recipe build.", "glm-recipe"
+    if "prewheels" in blob:
+        return "GLM build images", "Base image from before the Python wheels were added.", "glm-prewheels"
+    if "qualified-base" in blob:
+        return "GLM build images", "Qualified base image. Also tagged as the on-demand full image.", "glm-qualified"
+    if "full-base" in blob:
+        return "GLM build images", "Base image for the full GLM build.", "glm-full-base"
+    if "exl3" in blob or "glm53-baseline" in blob:
+        return "GLM build images", "EXL3 baseline. The local baseline tag and the MiaAI tag are this image.", "glm-exl3"
+    if "full-sm12x" in blob or "ondemand" in blob:
+        return "GLM build images", "Full GLM image, the on-demand build.", "glm-ondemand"
+    short = (tags[0] if tags else "untagged").split("/")[-1]
+    return "Other images", short, "other:" + short.lower()
+
+
+def _where_phrase(places, answered):
+    names = [p["name"] for p in places]
+    if answered and len(names) == answered:
+        return "On every machine"
+    if len(names) == 1:
+        return "Only on %s" % names[0]
+    if len(names) == 2:
+        return "On %s and %s" % (names[0], names[1])
+    return "On %s, and %s" % (", ".join(names[:-1]), names[-1])
+
+
+def _root_fs(node):
+    rows = node.get("filesystems") or []
+    for f in rows:
+        if f.get("mount") == "/" and f.get("kind") != "network":
+            return f
+    for f in rows:
+        if f.get("kind") != "network":
+            return f
+    return rows[0] if rows else None
+
+
+def _build_catalog(storage):
+    """One row per variant across the fleet, plus reclaim rankings for disks at 92% or more."""
+    nodes = list(storage or [])
+    answered = [n for n in nodes if n.get("reachable")]
+    families = {}
+    family_order = []
+    image_groups = {}
+    image_order = []
+
+    def _touch(bucket, order, key, title):
+        if key not in bucket:
+            bucket[key] = {"name": title, "variants": {}}
+            order.append(key)
+        return bucket[key]
+
+    for node in answered:
+        mark = _machine_mark(node.get("name"))
+        mounted = set()
+        running_images = set()
+        for head in node.get("heads") or []:
+            img = (head.get("image") or "").strip()
+            if img:
+                running_images.add(img)
+            for m in head.get("mounts") or []:
+                if m.get("source"):
+                    mounted.add(m["source"])
+        for model in node.get("models") or []:
+            family, label = _describe_checkpoint(model.get("name"))
+            group = _touch(families, family_order, family, family)
+            key = (model.get("name") or "").lower()
+            row = group["variants"].get(key)
+            if not row:
+                row = {"label": label, "folder": model.get("name"), "size": 0, "places": []}
+                group["variants"][key] = row
+            paths = [model.get("path")] + list(model.get("aliases") or [])
+            serving = any(p in mounted for p in paths if p)
+            row["size"] = max(row["size"], int(model.get("size") or 0))
+            place = next((p for p in row["places"] if p["key"] == node.get("key")), None)
+            if not place:
+                place = {"key": node.get("key"), "name": node.get("name"), "mark": mark,
+                         "serving": False, "copies": 0}
+                row["places"].append(place)
+            place["copies"] += 1
+            place["serving"] = place["serving"] or serving
+        for image in node.get("images") or []:
+            tags = image.get("tags") or []
+            group_name, label, slug = _describe_image(tags)
+            group = _touch(image_groups, image_order, group_name, group_name)
+            row = group["variants"].get(slug)
+            if not row:
+                row = {"label": label, "size": 0, "places": []}
+                group["variants"][slug] = row
+            row["size"] = max(row["size"], int(image.get("size") or 0))
+            serving = any(t in running_images for t in tags)
+            place = next((p for p in row["places"] if p["key"] == node.get("key")), None)
+            if not place:
+                place = {"key": node.get("key"), "name": node.get("name"), "mark": mark,
+                         "serving": False, "copies": 0}
+                row["places"].append(place)
+            place["copies"] += 1
+            place["serving"] = place["serving"] or serving
+
+    def _finish(bucket, order):
+        out = []
+        n_answered = len(answered)
+        for key in order:
+            group = bucket[key]
+            variants = list(group["variants"].values())
+            for row in variants:
+                row["serving"] = any(p["serving"] for p in row["places"])
+                row["where"] = _where_phrase(row["places"], n_answered)
+                extra = [p for p in row["places"] if p["copies"] > 1]
+                if extra:
+                    row["note"] = ", ".join("%s has %d folders of this" % (p["name"], p["copies"]) for p in extra)
+                else:
+                    row["note"] = ""
+            variants.sort(key=lambda r: -r["size"])
+            out.append({"name": group["name"], "variants": variants})
+        out.sort(key=lambda g: -(g["variants"][0]["size"] if g["variants"] else 0))
+        return out
+
+    pressure = []
+    for node in answered:
+        root = _root_fs(node)
+        if not root or root.get("pct") is None or root["pct"] < 92:
+            continue
+        docker = node.get("docker") or {}
+        items = []
+        reclaim_images = ((docker.get("images") or {}).get("reclaimable")) or 0
+        reclaim_cache = ((docker.get("build cache") or {}).get("reclaimable")) or 0
+        reclaim_containers = ((docker.get("containers") or {}).get("reclaimable")) or 0
+        if reclaim_images:
+            running_image_bytes = 0
+            running_refs = set()
+            for head in node.get("heads") or []:
+                if head.get("image"):
+                    running_refs.add(head["image"])
+            for image in node.get("images") or []:
+                if any(t in running_refs for t in (image.get("tags") or [])):
+                    running_image_bytes = max(running_image_bytes, int(image.get("size") or 0))
+            label = "Unused image data, as Docker reports it"
+            if running_image_bytes and reclaim_images >= running_image_bytes * 0.8 and reclaim_images <= running_image_bytes * 1.2:
+                label = "Unused image data, as Docker reports it. This is about the size of the image that is running, so it may not be free to delete"
+            items.append({"label": label, "bytes": int(reclaim_images)})
+        if reclaim_cache:
+            items.append({"label": "Docker build cache", "bytes": int(reclaim_cache)})
+        if reclaim_containers:
+            items.append({"label": "Stopped containers", "bytes": int(reclaim_containers)})
+        items.sort(key=lambda i: -i["bytes"])
+        biggest = None
+        for model in node.get("models") or []:
+            if biggest is None or (model.get("size") or 0) > biggest["bytes"]:
+                family, label = _describe_checkpoint(model.get("name"))
+                biggest = {"family": family, "label": label, "bytes": int(model.get("size") or 0)}
+        docker_best = items[0]["bytes"] if items else 0
+        pressure.append({
+            "key": node.get("key"), "name": node.get("name"), "mark": _machine_mark(node.get("name")),
+            "pct": root.get("pct"), "free": root.get("avail") or 0, "used": root.get("used") or 0,
+            "items": items, "biggest": biggest,
+            "weights_larger": bool(biggest and biggest["bytes"] > docker_best),
+        })
+    pressure.sort(key=lambda p: -(p["pct"] or 0))
+    marks = [{"key": n.get("key"), "name": n.get("name"), "mark": _machine_mark(n.get("name")),
+              "reachable": bool(n.get("reachable"))} for n in nodes]
+    return {
+        "marks": marks,
+        "weights": _finish(families, family_order),
+        "images": _finish(image_groups, image_order),
+        "pressure": pressure,
+    }
+
+
+def _catalog_lines(catalog):
+    if not catalog:
+        return []
+    lines = ["MODELS AND VARIANTS, counted once across the fleet. Letters are machines that have the files on their own SSD. NFS mounts are not counted."]
+    for group in catalog.get("weights") or []:
+        lines.append("- %s:" % group["name"])
+        for row in group["variants"]:
+            serving = " The running server has this mounted." if row.get("serving") else ""
+            note = (" " + row["note"] + ".") if row.get("note") else ""
+            lines.append("  - %s %s GiB. %s.%s%s" % (row["label"], _gib(row.get("size")), row.get("where"), serving, note))
+    lines.append("IMAGES, one row per image. Layer size is not unique disk use.")
+    for group in catalog.get("images") or []:
+        lines.append("- %s:" % group["name"])
+        for row in group["variants"]:
+            serving = " This image is running." if row.get("serving") else ""
+            lines.append("  - %s %s GiB. %s.%s" % (row["label"], _gib(row.get("size")), row.get("where"), serving))
+    if catalog.get("pressure"):
+        lines.append("DISK PRESSURE. 92% or more. This is a list only. Nothing is deleted.")
+        for p in catalog["pressure"]:
+            lines.append("- %s is %s%% full, %s GiB free." % (p["name"], "%.0f" % p["pct"] if p.get("pct") is not None else "?", _gib(p.get("free"))))
+            if p.get("items"):
+                lines.append("  Docker can give back, largest first: %s." % "; ".join(
+                    "%s %s GiB" % (i["label"], _gib(i["bytes"])) for i in p["items"]))
+            else:
+                lines.append("  Docker has nothing unused to give back.")
+            if p.get("weights_larger") and p.get("biggest"):
+                lines.append("  The checkpoints are larger than anything Docker can reclaim. Biggest is %s: %s %s GiB."
+                             % (p["biggest"].get("family"), (p["biggest"].get("label") or "").rstrip("."), _gib(p["biggest"]["bytes"])))
+    else:
+        lines.append("DISK PRESSURE: no machine is at 92% or more.")
+    return lines
+
+
 def _storage_line(disk):
     if not disk:
         return "  SSD: not polled yet."
@@ -1420,6 +1683,7 @@ def fleet_context():
                  % ("ALL OK" if agg["all_ok"] else "DEGRADED (down: %s)" % ", ".join(agg["down"]),
                     agg["gpu_count"], agg["total_power"], agg["hottest_unit"] or "n/a",
                     "%.0f" % agg["hottest_temp"] if agg["hottest_temp"] is not None else "n/a"))
+    lines.extend(_catalog_lines(s.get("catalog")))
     for n in s["nodes"]:
         disk = next((d for d in s.get("storage") or [] if d.get("key") == n["key"]), None)
         if not n.get("reachable"):

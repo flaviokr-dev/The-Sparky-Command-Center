@@ -1,7 +1,7 @@
 import { useDash } from '../lib/store'
 import { Panel, Bar, Pill, Led, Empty } from '../components/Panel'
 import { ago, fmtGB, isNum, type Tone } from '../lib/format'
-import type { DockerImage, Filesystem, LocalModel, ModelHead, NodeStorage } from '../lib/api'
+import type { CatalogGroup, DockerImage, Filesystem, FleetCatalog, LocalModel, ModelHead, NodeStorage } from '../lib/api'
 
 function tone(pct: number | null | undefined): Tone {
   if (!isNum(pct)) return 'muted'
@@ -34,6 +34,7 @@ export function Storage() {
   const used = sum(roots, 'used')
   const free = sum(roots, 'avail')
   const tight = [...live].sort((a, b) => (rootOf(b)?.pct || 0) - (rootOf(a)?.pct || 0))[0]
+  const catalog = metrics.catalog
 
   return (
     <div className="storage">
@@ -46,10 +47,12 @@ export function Storage() {
           </div>
           <p className="storage__note">
             {tight ? `${tight.name} is the fullest, ${rootOf(tight)?.pct ?? '-'}% on ${rootOf(tight)?.mount}.` : 'No disk reading yet.'}
-            {' '}Each machine lists what is on its own SSD: checkpoints, Docker images, and the running head. Refreshed every 30s.
+            {' '}A letter below lights when that machine has the files on its own SSD.
           </p>
+          {catalog && <Pressure catalog={catalog} />}
         </Panel>
       </div>
+      {catalog && <Catalog catalog={catalog} />}
       <div className="cards cards--4">
         {nodes.map(n => {
           const root = rootOf(n)
@@ -126,6 +129,73 @@ function FsTable({ title, rows }: { title: string; rows: Filesystem[] }) {
           ))}
         </tbody>
       </table>
+    </>
+  )
+}
+
+function Pressure({ catalog }: { catalog: FleetCatalog }) {
+  const rows = catalog.pressure || []
+  if (!rows.length) {
+    return <p className="storage__note">No machine is at 92% or more.</p>
+  }
+  return (
+    <div className="pressure">
+      {rows.map(p => (
+        <div key={p.key} className="pressure__node">
+          <b>{p.name} is {p.pct ?? '-'}% full, {fmtGB(p.free)} GiB free.</b>
+          {p.items.length ? (
+            <ol>
+              {p.items.map((item, i) => (
+                <li key={item.label}>{item.label}: {fmtGB(item.bytes)} GiB{i === 0 ? ', the most Docker can give back' : ''}</li>
+              ))}
+            </ol>
+          ) : <p>Docker has nothing unused to give back on this machine.</p>}
+          {p.weights_larger && p.biggest && (
+            <p>The checkpoints are larger than that. The biggest is {p.biggest.family}: {p.biggest.label} {fmtGB(p.biggest.bytes)} GiB. This list does not delete it.</p>
+          )}
+        </div>
+      ))}
+      <p className="storage__note">A ranking only. Nothing is deleted from this page.</p>
+    </div>
+  )
+}
+
+function Catalog({ catalog }: { catalog: FleetCatalog }) {
+  return (
+    <Panel className="card--wide" title={<>Models and variants</>}
+      chips={<span className="chip chip--muted">one row across the fleet</span>}>
+      <p className="storage__note">Same files on more than one machine are one row. A filled letter means that SSD has the copy. Cyan means the running server on that machine is using it.</p>
+      <GroupList title="Weights" groups={catalog.weights} marks={catalog.marks} empty="No checkpoints reported yet." />
+      <GroupList title="Images" groups={catalog.images} marks={catalog.marks} empty="No images reported yet." />
+    </Panel>
+  )
+}
+
+function GroupList({ title, groups, marks, empty }: { title: string; groups: CatalogGroup[]; marks: FleetCatalog['marks']; empty: string }) {
+  return (
+    <>
+      <div className="subhead">{title}</div>
+      {groups.length ? groups.map(group => (
+        <section key={group.name} className="family">
+          <h3>{group.name}</h3>
+          {group.variants.map(row => (
+            <article key={(row.folder || row.label) + row.label} className={`variant${row.serving ? ' is-serving' : ''}`}>
+              <div className="variant__copy">
+                <b>{row.label}</b>
+                {row.folder && <span className="mono variant__folder">{row.folder}</span>}
+                <span>{fmtGB(row.size)} GiB{row.places.length > 1 ? ' each' : ''}. {row.where}{row.note ? `. ${row.note}` : ''}{row.serving ? '. In the running server.' : ''}</span>
+              </div>
+              <div className="marks" aria-label={row.where}>
+                {marks.map(m => {
+                  const hit = row.places.find(p => p.key === m.key)
+                  const state = !m.reachable ? 'down' : hit ? (hit.serving ? 'serving' : 'on') : 'off'
+                  return <span key={m.key} className={`mark is-${state}`} title={m.name}>{m.mark}</span>
+                })}
+              </div>
+            </article>
+          ))}
+        </section>
+      )) : <p className="storage__note">{empty}</p>}
     </>
   )
 }

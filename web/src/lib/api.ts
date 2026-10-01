@@ -104,9 +104,31 @@ export interface NodeStorage {
   images?: DockerImage[]; docker?: Record<string, DockerUse>
   heads?: ModelHead[]; models?: LocalModel[]
 }
+export interface CatalogPlace {
+  key: string; name: string; mark: string; serving: boolean; copies: number
+}
+export interface CatalogVariant {
+  label: string; folder?: string; size: number; where: string; serving: boolean; note: string
+  places: CatalogPlace[]
+}
+export interface CatalogGroup { name: string; variants: CatalogVariant[] }
+export interface CatalogMark { key: string; name: string; mark: string; reachable: boolean }
+export interface PressureItem { label: string; bytes: number }
+export interface PressureNode {
+  key: string; name: string; mark: string; pct: number | null; free: number; used: number
+  items: PressureItem[]
+  biggest: { family: string; label: string; bytes: number } | null
+  weights_larger: boolean
+}
+export interface FleetCatalog {
+  marks: CatalogMark[]
+  weights: CatalogGroup[]
+  images: CatalogGroup[]
+  pressure: PressureNode[]
+}
 export interface Metrics {
   ts: number; version: string; read_only: boolean
-  nodes: FleetNode[]; storage?: NodeStorage[]; switch: SwitchState; history: Record<string, number[]>; models: ModelState[]
+  nodes: FleetNode[]; storage?: NodeStorage[]; catalog?: FleetCatalog; switch: SwitchState; history: Record<string, number[]>; models: ModelState[]
   agg: { gpu_count: number; total_power: number; hottest_unit: string | null; hottest_temp: number | null; all_ok: boolean; down: string[] }
   thresholds: { temp_warn: number; temp_hot: number; stale_after_s: number }
 }
