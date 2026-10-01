@@ -78,9 +78,35 @@ export interface ModelState {
   decode_tps?: number | null; prefill_tps?: number | null; ttft_ms?: number | null; kv_pct?: number | null
   running?: number | null; waiting?: number | null; ts: number; err: string | null
 }
+export interface DiskDevice {
+  name: string; size: number; model: string | null; tran: string | null; rotational: boolean
+}
+export interface Filesystem {
+  source: string; mount: string; kind?: 'local' | 'network'
+  size: number; used: number; avail: number; pct: number | null
+}
+export interface DockerImage {
+  id: string; tags: string[]; size: number
+}
+export interface DockerUse {
+  size: number | null; reclaimable: number | null
+}
+export interface HeadMount { source: string; dest: string }
+export interface ModelHead {
+  name: string; image: string; status: string; mounts: HeadMount[]
+}
+export interface LocalModel {
+  path: string; name: string; size: number; device: string; aliases?: string[]
+}
+export interface NodeStorage {
+  key: string; name: string; reachable: boolean; ts: number; err: string | null
+  disks: DiskDevice[]; filesystems: Filesystem[]
+  images?: DockerImage[]; docker?: Record<string, DockerUse>
+  heads?: ModelHead[]; models?: LocalModel[]
+}
 export interface Metrics {
   ts: number; version: string; read_only: boolean
-  nodes: FleetNode[]; switch: SwitchState; history: Record<string, number[]>; models: ModelState[]
+  nodes: FleetNode[]; storage?: NodeStorage[]; switch: SwitchState; history: Record<string, number[]>; models: ModelState[]
   agg: { gpu_count: number; total_power: number; hottest_unit: string | null; hottest_temp: number | null; all_ok: boolean; down: string[] }
   thresholds: { temp_warn: number; temp_hot: number; stale_after_s: number }
 }

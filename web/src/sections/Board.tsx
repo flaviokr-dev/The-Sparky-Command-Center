@@ -9,6 +9,7 @@ import { Video } from './Video'
 import { Tokens } from './Tokens'
 import { Eco } from './Eco'
 import { Stations } from './Stations'
+import { Storage } from './Storage'
 import { clock } from '../lib/format'
 import type { SectionCfg } from '../lib/api'
 
@@ -39,6 +40,7 @@ export function Board() {
     for (const s of config.sections) {
       out.push({ id: s.key, eyebrow: s.eyebrow || s.title, title: s.title, subtitle: s.subtitle, render: () => <FleetSection s={s} subs={subs.subs} toggleSub={subs.toggle} /> })
     }
+    out.push({ id: 'storage', eyebrow: 'SSD', title: 'Storage', subtitle: 'disks and filesystems on every node', tone: 'amber', render: () => <Storage /> })
     if (config.comfy.enabled) out.push({ id: 'video', eyebrow: 'Render lanes', title: config.comfy.title, tone: 'violet', render: () => <Video /> })
     if (config.stations.enabled || config.keylights.enabled) out.push({ id: 'stations', eyebrow: 'Web stations', title: 'Stations & lights', render: () => <Stations /> })
     return out

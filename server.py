@@ -185,6 +185,9 @@ STATE = {
     "switch": {"reachable": False, "ts": 0, "err": "warming up"},
     "models": {},
     "comfy": {},
+    "storage": {n["key"]: {"key": n["key"], "name": n.get("name", n["key"]),
+                           "reachable": False, "ts": 0, "err": "warming up",
+                           "disks": [], "filesystems": []} for n in NODES},
 }
 _hist = {}
 
@@ -429,6 +432,276 @@ def poll_discrete(node):
     except Exception as e:  # noqa
         res["err"] = ("parse: %s" % e)[:140]
     return res
+
+
+# Virtual mounts are not the SSD. Keep real filesystems and the block devices.
+_SKIP_FS = {"tmpfs", "devtmpfs", "overlay", "squashfs", "udev", "none", "efivarfs",
+            "devpts", "cgroup", "cgroup2", "proc", "sysfs", "securityfs", "pstore",
+            "bpf", "tracefs", "debugfs", "hugetlbfs", "mqueue", "fusectl", "configfs",
+            "ramfs", "nsfs"}
+_DISK_MARKS = ("PIPEDF", "PIPEBLK", "PIPEIMG", "PIPEDOCKER", "PIPEHEAD", "PIPEMODELS")
+_DISK_REMOTE = r"""
+echo PIPEDF
+df -B1 -P 2>/dev/null | tail -n +2
+echo PIPEBLK
+lsblk -b -d -n -o NAME,SIZE,TYPE,ROTA,TRAN,MODEL 2>/dev/null
+echo PIPEIMG
+ids=$(docker images -q 2>/dev/null | sort -u)
+if [ -n "$ids" ]; then
+  docker image inspect --format '{{.Id}}|{{json .RepoTags}}|{{.Size}}' $ids 2>/dev/null
+fi
+echo PIPEDOCKER
+docker system df --format '{{.Type}}|{{.Size}}|{{.Reclaimable}}' 2>/dev/null
+echo PIPEHEAD
+ids=$(docker ps -q 2>/dev/null)
+if [ -n "$ids" ]; then
+  docker inspect --format '{{.Name}}|{{.Config.Image}}|{{.State.Status}}|{{range .Mounts}}{{.Source}}=>{{.Destination}};;{{end}}' $ids 2>/dev/null
+fi
+echo PIPEMODELS
+# Checkpoints that live on this box's own disk. -xdev skips NFS mounts, so a
+# weight tree served from another Spark is not counted as local.
+find -P /home/midas/models /home/midas/deepseek -xdev -maxdepth 4 -name config.json -type f 2>/dev/null |
+while IFS= read -r cfg; do
+  d=$(dirname "$cfg")
+  src=$(df -P "$d" 2>/dev/null | awk 'NR==2 {print $1}')
+  case "$src" in
+    /dev/*) ;;
+    *) continue ;;
+  esac
+  sz=$(timeout 20 du -sb "$d" 2>/dev/null | awk '{print $1}')
+  [ -n "$sz" ] || continue
+  ino=$(stat -c '%i' "$cfg" 2>/dev/null || echo 0)
+  echo "$sz|$src|$ino|$d"
+done
+"""
+
+
+def _parse_df(text):
+    rows = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        src, size, used, avail, pct, mount = parts[0], parts[1], parts[2], parts[3], parts[4], " ".join(parts[5:])
+        if src in _SKIP_FS or src.startswith("/dev/loop"):
+            continue
+        if mount.startswith("/snap") or mount in ("/dev", "/dev/shm", "/run", "/run/lock", "/sys/fs/cgroup"):
+            continue
+        size_b, used_b, avail_b = _num(size), _num(used), _num(avail)
+        if not size_b or size_b < 512 * 1024 * 1024:
+            continue
+        pct_n = _num(pct.replace("%", ""))
+        kind = "local" if src.startswith("/dev/") else "network"
+        rows.append({
+            "source": src, "mount": mount, "kind": kind,
+            "size": int(size_b), "used": int(used_b or 0), "avail": int(avail_b or 0),
+            "pct": pct_n,
+        })
+    rows.sort(key=lambda r: (r["mount"] != "/", -r["size"]))
+    return rows
+
+
+def _parse_blk(text):
+    disks = []
+    for line in text.splitlines():
+        parts = line.split()
+        # NAME SIZE TYPE ROTA TRAN MODEL...
+        if len(parts) < 5:
+            continue
+        name, size, typ, rota, tran = parts[:5]
+        if typ != "disk":
+            continue
+        size_b = _num(size)
+        if not size_b:
+            continue
+        model = " ".join(parts[5:]).strip()
+        disks.append({
+            "name": name, "size": int(size_b),
+            "model": None if model in ("", "-") else model,
+            "tran": None if tran in ("", "-") else tran,
+            "rotational": rota == "1",
+        })
+    return disks
+
+
+def _disk_sections(text):
+    found = []
+    for mark in _DISK_MARKS:
+        at = text.find(mark)
+        if at >= 0:
+            found.append((at, mark))
+    found.sort()
+    out = {mark: "" for mark in _DISK_MARKS}
+    for i, (at, mark) in enumerate(found):
+        start = at + len(mark)
+        end = found[i + 1][0] if i + 1 < len(found) else len(text)
+        out[mark] = text[start:end]
+    return out
+
+
+def _human_bytes(text):
+    m = re.match(r"\s*([0-9.]+)\s*([KMGT]B|B)\s*$", text or "", re.I)
+    if not m:
+        return None
+    n = float(m.group(1))
+    unit = m.group(2).upper()
+    scale = { "B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12 }
+    return int(n * scale.get(unit, 1))
+
+
+def _parse_images(text):
+    rows = []
+    for line in text.splitlines():
+        if line.count("|") < 2:
+            continue
+        ident, tags_json, size = line.split("|", 2)
+        try:
+            tags = json.loads(tags_json)
+        except Exception:
+            tags = []
+        if not isinstance(tags, list) or not tags:
+            tags = ["<none>:<none>"]
+        size_b = _num(size.strip())
+        if not size_b:
+            continue
+        rows.append({
+            "id": ident.replace("sha256:", "")[:12],
+            "tags": tags,
+            "size": int(size_b),
+        })
+    rows.sort(key=lambda r: -r["size"])
+    return rows
+
+
+def _parse_docker_df(text):
+    out = {}
+    for line in text.splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 3:
+            continue
+        out[parts[0].lower()] = {
+            "size": _human_bytes(parts[1]),
+            "reclaimable": _human_bytes(parts[2].split("(")[0]),
+        }
+    return out
+
+
+def _parse_heads(text):
+    rows = []
+    for line in text.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) < 3:
+            continue
+        name = parts[0].lstrip("/")
+        image, status = parts[1], parts[2]
+        mounts = []
+        for bit in (parts[3] if len(parts) > 3 else "").split(";;"):
+            if "=>" not in bit:
+                continue
+            src, dest = bit.split("=>", 1)
+            src, dest = src.strip(), dest.strip()
+            if not src:
+                continue
+            mounts.append({"source": src, "dest": dest})
+        def _weight(m):
+            src, dest = m["source"], m["dest"]
+            if dest == "/models" or dest.startswith("/models/"):
+                return True
+            return src.startswith("/home/midas/models/") or src.startswith("/home/midas/deepseek")
+        model_mounts = [m for m in mounts if _weight(m)]
+        interesting = bool(model_mounts) or any(
+            x in name.lower() for x in ("vllm", "glm", "dsv41", "sglang", "head"))
+        if not interesting:
+            continue
+        rows.append({
+            "name": name, "image": image, "status": status,
+            "mounts": model_mounts[:6],
+        })
+    return rows
+
+
+def _pick_model_path(paths):
+    def score(p):
+        name = p.rstrip("/").split("/")[-1]
+        hexish = len(name) >= 32 and all(c in "0123456789abcdef" for c in name)
+        return (1 if hexish else 0, 0 if "/hf/" in p else 1, len(p))
+    return sorted(paths, key=score)[0]
+
+
+def _parse_model_dirs(text):
+    grouped = {}
+    order = []
+    for line in text.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) < 4:
+            continue
+        size_b = _num(parts[0])
+        if not size_b or size_b < 100 * 1024 * 1024:
+            continue
+        ino = parts[2].strip() or "0"
+        path = parts[3].strip()
+        key = ino if ino != "0" else "p:" + path
+        if key in grouped:
+            grouped[key]["paths"].append(path)
+            continue
+        row = {"paths": [path], "size": int(size_b), "device": parts[1].strip()}
+        grouped[key] = row
+        order.append(row)
+    rows = []
+    for row in order:
+        primary = _pick_model_path(row["paths"])
+        rows.append({
+            "path": primary,
+            "name": primary.rstrip("/").split("/")[-1],
+            "size": row["size"],
+            "device": row["device"],
+            "aliases": [p for p in row["paths"] if p != primary],
+        })
+    rows.sort(key=lambda r: -r["size"])
+    return rows
+
+
+def poll_storage(node):
+    res = {
+        "key": node["key"], "name": node.get("name", node["key"]),
+        "reachable": False, "ts": time.time(), "err": None,
+        "disks": [], "filesystems": [],
+        "images": [], "docker": {}, "heads": [], "models": [],
+    }
+    rc, out, err = _run(remote_argv(node, _DISK_REMOTE), timeout=75)
+    if "PIPEDF" not in out:
+        res["err"] = (err or out or "no output").strip()[:140]
+        return res
+    try:
+        parts = _disk_sections(out)
+        res["filesystems"] = _parse_df(parts["PIPEDF"])
+        res["disks"] = _parse_blk(parts["PIPEBLK"])
+        res["images"] = _parse_images(parts["PIPEIMG"])
+        res["docker"] = _parse_docker_df(parts["PIPEDOCKER"])
+        res["heads"] = _parse_heads(parts["PIPEHEAD"])
+        res["models"] = _parse_model_dirs(parts["PIPEMODELS"])
+        res["reachable"] = bool(res["filesystems"] or res["disks"] or res["models"] or res["images"])
+        if not res["reachable"]:
+            res["err"] = "no disks reported"
+        elif rc != 0 and not res["models"] and not res["images"]:
+            res["err"] = (err or "partial").strip()[:140]
+    except Exception as e:  # noqa
+        res["err"] = ("parse: %s" % e)[:140]
+    return res
+
+
+def _storage_loop(node, offset):
+    time.sleep(offset)
+    while True:
+        try:
+            r = poll_storage(node)
+        except Exception as e:  # noqa
+            r = {"key": node["key"], "name": node.get("name"), "reachable": False,
+                 "ts": time.time(), "err": str(e)[:140], "disks": [], "filesystems": [],
+                 "images": [], "docker": {}, "heads": [], "models": []}
+        with _lock:
+            STATE["storage"][node["key"]] = r
+        time.sleep(30)
 
 
 def _node_loop(node, offset):
@@ -895,6 +1168,7 @@ def read_tokens():
 def start_pollers():
     for i, n in enumerate(NODES):
         threading.Thread(target=_node_loop, args=(n, i * 1.2), daemon=True).start()
+        threading.Thread(target=_storage_loop, args=(n, 0.4 + i * 0.8), daemon=True).start()
     if SWITCH:
         threading.Thread(target=_switch_loop, daemon=True).start()
     for i, ln in enumerate(COMFY_LANES):
@@ -914,6 +1188,9 @@ def start_pollers():
 def snapshot():
     with _lock:
         nodes = [dict(STATE["nodes"][n["key"]]) for n in NODES]
+        storage = [dict(STATE["storage"].get(n["key"], {"key": n["key"], "name": n.get("name"),
+                                                        "reachable": False, "disks": [], "filesystems": []}
+                                              )) for n in NODES]
         switch = dict(STATE["switch"]) if SWITCH else None
         hist = {k: list(v) for k, v in _hist.items()}
         models = [dict(STATE["models"][m["key"]]) for m in MODELS if m["key"] in STATE["models"]]
@@ -958,6 +1235,7 @@ def snapshot():
         "version": VERSION,
         "read_only": READ_ONLY,
         "nodes": nodes,
+        "storage": storage,
         "sparks": unified,             # v1 name, kept for API consumers
         "switch": switch or {"reachable": False, "ts": 0, "err": "not configured"},
         "box": legacy_box,             # v1 name: the first discrete host
@@ -1079,6 +1357,60 @@ def _age(ts):
     return int(time.time() - ts) if ts else None
 
 
+def _gib(n):
+    if n is None:
+        return "n/a"
+    return "%.1f" % (n / (1024.0 ** 3))
+
+
+def _storage_line(disk):
+    if not disk:
+        return "  SSD: not polled yet."
+    if not disk.get("reachable"):
+        return "  SSD: UNREACHABLE (%s)." % (disk.get("err") or "no response")
+    devs = ", ".join("%s %s GiB%s" % (d["name"], _gib(d["size"]), " " + d["model"] if d.get("model") else "")
+                     for d in disk.get("disks") or [])
+    mounts = "; ".join("%s %s/%s GiB used (%s%% free %s GiB)"
+                       % (f["mount"], _gib(f["used"]), _gib(f["size"]),
+                          "%.0f" % f["pct"] if f.get("pct") is not None else "?",
+                          _gib(f["avail"]))
+                       for f in disk.get("filesystems") or [])
+    bits = ["  SSD %s: disks [%s]. Filesystems: %s." % (disk.get("name"), devs or "none listed", mounts or "none")]
+    models = disk.get("models") or []
+    if models:
+        shown = ", ".join("%s %s GiB%s" % (m["name"], _gib(m["size"]),
+                                            " (also linked at %d other path%s)" % (len(m["aliases"]), "" if len(m["aliases"]) == 1 else "s") if m.get("aliases") else "")
+                          for m in models[:8])
+        extra = len(models) - 8
+        bits.append("  Checkpoints on this SSD (%d): %s%s."
+                    % (len(models), shown, " +%d more" % extra if extra > 0 else ""))
+    else:
+        bits.append("  Checkpoints on this SSD: none (NFS copies are not counted here).")
+    images = disk.get("images") or []
+    docker = disk.get("docker") or {}
+    img_df = (docker.get("images") or {}).get("size")
+    if images:
+        shown = ", ".join("%s %s GiB" % ((i["tags"][0] if i.get("tags") else i.get("id")), _gib(i["size"]))
+                          for i in images[:6])
+        extra = len(images) - 6
+        uniq = " Docker reports %.0f GB of images on disk." % (img_df / 1e9) if img_df else ""
+        bits.append("  Images (%d, layer size counts shared layers on each image): %s%s.%s"
+                    % (len(images), shown, " +%d more" % extra if extra > 0 else "", uniq))
+    else:
+        bits.append("  Images: none reported.")
+    heads = disk.get("heads") or []
+    if heads:
+        parts = []
+        for h in heads[:4]:
+            mounts = ", ".join("%s=>%s" % (m["source"], m["dest"]) for m in (h.get("mounts") or [])[:3])
+            parts.append("%s %s (%s)%s" % (h["name"], h.get("status"), h.get("image"),
+                                           " mounts " + mounts if mounts else ""))
+        bits.append("  Heads: %s." % "; ".join(parts))
+    else:
+        bits.append("  Heads: no model server container running on this box.")
+    return "\n".join(bits)
+
+
 def fleet_context():
     """A compact plain-text read of the live dashboard for the chat's system prompt."""
     s = snapshot()
@@ -1089,9 +1421,11 @@ def fleet_context():
                     agg["gpu_count"], agg["total_power"], agg["hottest_unit"] or "n/a",
                     "%.0f" % agg["hottest_temp"] if agg["hottest_temp"] is not None else "n/a"))
     for n in s["nodes"]:
+        disk = next((d for d in s.get("storage") or [] if d.get("key") == n["key"]), None)
         if not n.get("reachable"):
             lines.append("- NODE %s: UNREACHABLE (%s), last good poll %ss ago."
                          % (n["name"], n.get("err") or "no response", _age(n.get("ts"))))
+            lines.append(_storage_line(disk))
             continue
         if n.get("profile") == "unified":
             lines.append("- NODE %s (unified-memory GPU%s): %s C, %s W, util %s%%, SM %s MHz, memory %s/%s GiB (%s%%), model resident %s GiB, serving %s%s."
@@ -1100,6 +1434,7 @@ def fleet_context():
                             n.get("mem_used_gib"), n.get("mem_total_gib"), n.get("mem_pct"),
                             n.get("model_gib"), n.get("model") or "nothing",
                             " (%s)" % n["pair"] if n.get("pair") else ""))
+            lines.append(_storage_line(disk))
         else:
             gp = "; ".join("GPU%s %s %s C %s/%s W util %s%% VRAM %.1f/%.1f GiB"
                            % (g["index"], g.get("name"), g.get("temp"), g.get("power"),
@@ -1110,6 +1445,7 @@ def fleet_context():
             lines.append("- NODE %s (%s GPUs): CPU %s C, RAM %s%%. %s.%s"
                          % (n["name"], len(n.get("gpus") or []), n.get("cpu_temp"), n.get("mem_pct"),
                             gp, " Containers: %s." % cont if cont else ""))
+            lines.append(_storage_line(disk))
     if SWITCH:
         sw = s["switch"]
         if sw.get("reachable"):
