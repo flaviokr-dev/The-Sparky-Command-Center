@@ -1,7 +1,7 @@
 import { useDash } from '../lib/store'
 import { Panel, Bar, Pill, Led, Empty } from '../components/Panel'
 import { ago, fmtGB, isNum, type Tone } from '../lib/format'
-import type { Filesystem, ModelHead, NodeStorage } from '../lib/api'
+import type { DockerImage, Filesystem, LocalModel, ModelHead, NodeStorage } from '../lib/api'
 
 function tone(pct: number | null | undefined): Tone {
   if (!isNum(pct)) return 'muted'
@@ -130,93 +130,125 @@ function FsTable({ title, rows }: { title: string; rows: Filesystem[] }) {
   )
 }
 
+function shortName(ref: string) {
+  const [repo, ver] = ref.split(':')
+  const name = (repo || ref).split('/').pop() || ref
+  return ver ? `${name}:${ver}` : name
+}
+
+function shareLabel(part: number, whole: number) {
+  if (!whole) return ''
+  const pct = (part / whole) * 100
+  if (pct < 1) return '<1%'
+  return `${Math.round(pct)}%`
+}
+
+function servingPaths(heads: ModelHead[]) {
+  return new Set(heads.flatMap(h => h.mounts.map(m => m.source)))
+}
+
+function isServing(model: LocalModel, live: Set<string>) {
+  return live.has(model.path) || (model.aliases || []).some(a => live.has(a))
+}
+
 function Contents({ node }: { node: NodeStorage }) {
   const models = node.models || []
   const images = node.images || []
   const heads = node.heads || []
   const dockerImages = node.docker?.images
   const modelBytes = models.reduce((a, m) => a + (m.size || 0), 0)
+  const maxModel = models.reduce((a, m) => Math.max(a, m.size || 0), 0)
+  const maxImage = images.reduce((a, m) => Math.max(a, m.size || 0), 0)
+  const live = servingPaths(heads)
   return (
     <>
-      <div className="subhead">Models on this SSD</div>
-      <p className="storage__note">Folders with a config.json on this disk. A copy mounted from another Spark is not listed here. Hardlinked copies of the same files are one row.</p>
+      <div className="subhead">Models <i>{models.length ? `${fmtGB(modelBytes)} GiB on this SSD` : 'none on this SSD'}</i></div>
       {models.length ? (
-        <table className="storage__table">
-          <thead>
-            <tr><th>Checkpoint</th><th>Path</th><th>Size</th></tr>
-          </thead>
-          <tbody>
-            {models.map(m => (
-              <tr key={m.path}>
-                <td>{m.name}</td>
-                <td className="mono storage__src" title={[m.path, ...(m.aliases || [])].join('\n')}>
-                  {m.path}
-                  {(m.aliases || []).map(a => <div key={a}>{a}</div>)}
-                </td>
-                <td>{fmtGB(m.size)} GiB</td>
-              </tr>
+        <div className="rack">
+          <div className="rack__map" aria-hidden>
+            {models.map((m, i) => (
+              <div key={m.path} className={`rack__seg hue-${i % 4}${isServing(m, live) ? ' is-live' : ''}`} style={{ flexGrow: m.size }} title={`${m.name} ${fmtGB(m.size)} GiB`} />
             ))}
-          </tbody>
-        </table>
-      ) : <p className="storage__note">No local checkpoint on this SSD.</p>}
-      {models.length > 1 && (
-        <p className="storage__note">Sum of those folders: {fmtGB(modelBytes)} GiB.</p>
-      )}
+          </div>
+          {models.map((m, i) => (
+            <Weight key={m.path} model={m} hue={i % 4} max={maxModel} total={modelBytes} live={isServing(m, live)} />
+          ))}
+        </div>
+      ) : <p className="storage__note">No local checkpoint on this SSD. Weights mounted from another machine stay off this list.</p>}
 
-      <div className="subhead">Images</div>
-      <p className="storage__note">
-        {images.length} image{images.length === 1 ? '' : 's'}
-        {dockerImages?.size ? `, ${fmtGB(dockerImages.size)} GiB unique on disk` : ''}
-        {dockerImages?.reclaimable ? `, ${fmtGB(dockerImages.reclaimable)} GiB reclaimable` : ''}.
-        {' '}The size next to each tag is the layer total, so shared layers appear on every image that uses them.
-      </p>
+      <div className="subhead">Images <i>{dockerImages?.size ? `${fmtGB(dockerImages.size)} GiB unique` : `${images.length} on disk`}</i></div>
       {images.length ? (
-        <table className="storage__table">
-          <thead>
-            <tr><th>Tag</th><th>Id</th><th>Layers</th></tr>
-          </thead>
-          <tbody>
-            {images.map(img => (
-              <tr key={img.id + (img.tags[0] || '')}>
-                <td className="storage__tags">{img.tags.join(', ')}</td>
-                <td className="mono storage__src">{img.id}</td>
-                <td>{fmtGB(img.size)} GiB</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div className="shelf">
+          {images.map((img, i) => (
+            <Can key={img.id + (img.tags[0] || '')} img={img} hue={i % 4} max={maxImage} />
+          ))}
+        </div>
       ) : <p className="storage__note">No Docker images reported.</p>}
+      {dockerImages?.reclaimable ? (
+        <p className="storage__note">{fmtGB(dockerImages.reclaimable)} GiB of images can be reclaimed. Each block’s number is its layer total, so a shared layer shows up on every image that uses it.</p>
+      ) : null}
 
-      <div className="subhead">Heads</div>
-      <p className="storage__note">The model server running on this machine, and the weight path mounted into it.</p>
-      {heads.length ? heads.map(h => <HeadRow key={h.name} head={h} />) : (
+      <div className="subhead">Heads <i>{heads.length ? `${heads.length} running` : 'idle'}</i></div>
+      {heads.length ? heads.map(h => <Engine key={h.name} head={h} models={models} />) : (
         <p className="storage__note">No model server container running here.</p>
       )}
     </>
   )
 }
 
-function HeadRow({ head }: { head: ModelHead }) {
+function Weight({ model, hue, max, total, live }: { model: LocalModel; hue: number; max: number; total: number; live: boolean }) {
+  const width = max ? Math.max(8, (model.size / max) * 100) : 0
   return (
-    <div className="storage__head">
-      <div className="storage__disk">
-        <b>{head.name}</b>
-        <span>{head.status}</span>
-        <span className="storage__tags">{head.image}</span>
+    <article className={`weight hue-${hue}${live ? ' is-live' : ''}`}>
+      <div className="weight__fill" style={{ width: `${width}%` }} />
+      <div className="weight__body">
+        <span className="weight__gib">{fmtGB(model.size)}<small>GiB</small></span>
+        <div className="weight__id">
+          <b>{model.name}{live && <em>serving</em>}</b>
+          <span className="mono" title={[model.path, ...(model.aliases || [])].join('\n')}>{model.path}</span>
+          {(model.aliases || []).length > 0 && (
+            <span className="weight__alias">same files also at {(model.aliases || []).join(' · ')}</span>
+          )}
+        </div>
+        <span className="weight__share">{shareLabel(model.size, total)}</span>
       </div>
-      {head.mounts.length ? (
-        <table className="storage__table">
-          <thead><tr><th>On disk</th><th>Inside the container</th></tr></thead>
-          <tbody>
-            {head.mounts.map(m => (
-              <tr key={m.source + m.dest}>
-                <td className="mono storage__src" title={m.source}>{m.source}</td>
-                <td className="mono">{m.dest}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      ) : <p className="storage__note">Running, with no model directory mounted.</p>}
+    </article>
+  )
+}
+
+function Can({ img, hue, max }: { img: DockerImage; hue: number; max: number }) {
+  const grow = max ? Math.max(1, Math.round((img.size / max) * 6)) : 1
+  const tags = img.tags || []
+  return (
+    <article className={`can hue-${hue}`} style={{ flexGrow: grow }} title={tags.join('\n')}>
+      <span className="can__size">{fmtGB(img.size)}<small>GiB</small></span>
+      <span className="can__tag">{shortName(tags[0] || img.id)}{tags.length > 1 ? ` +${tags.length - 1}` : ''}</span>
+      <span className="mono can__id">{img.id}</span>
+    </article>
+  )
+}
+
+function Engine({ head, models }: { head: ModelHead; models: LocalModel[] }) {
+  const local = new Set(models.flatMap(m => [m.path, ...(m.aliases || [])]))
+  return (
+    <div className="engine">
+      <div className="engine__box">
+        <span className="engine__status"><Led on={head.status === 'running'} />{head.status}</span>
+        <b>{head.name}</b>
+        <span className="engine__image" title={head.image}>{shortName(head.image)}</span>
+      </div>
+      <div className="engine__mounts">
+        {head.mounts.length ? head.mounts.map(m => {
+          const here = local.has(m.source)
+          const leaf = m.source.split('/').filter(Boolean).pop() || m.source
+          return (
+            <div key={m.source + m.dest} className={`mount${here ? ' is-here' : ''}`}>
+              <span className="mount__dest">{m.dest}</span>
+              <span className="mount__src" title={m.source}>{leaf} · {here ? 'this SSD' : 'another machine'}</span>
+            </div>
+          )
+        }) : <p className="storage__note">Running, with no model directory mounted.</p>}
+      </div>
     </div>
   )
 }
